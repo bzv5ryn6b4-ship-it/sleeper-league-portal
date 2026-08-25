@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import pandas as pd
 import requests
@@ -104,7 +105,7 @@ def fp_get(path, key):
         return None
     r = requests.get(
         f"{FP}{path}",
-        headers={"x-api-key": key, "User-Agent": "SleeperGM/6.1"},
+        headers={"x-api-key": key, "User-Agent": "SleeperGM/6.4"},
         timeout=20,
     )
     r.raise_for_status()
@@ -130,7 +131,7 @@ def fp_diagnostics(season, key, scoring="PPR"):
         return diag
     try:
         url=f"{FP}/nfl/{season}/consensus-rankings?position=RB&scoring={scoring}"
-        r=requests.get(url,headers={"x-api-key":key,"User-Agent":"SleeperGM/6.1"},timeout=20)
+        r=requests.get(url,headers={"x-api-key":key,"User-Agent":"SleeperGM/6.4"},timeout=20)
         diag["status"]=r.status_code
         if not r.ok:
             diag["message"]=f"FantasyPros HTTP {r.status_code}: {r.text[:180]}"
@@ -205,6 +206,91 @@ def fp_rankings(season, key, scoring="PPR"):
         except Exception:
             pass
     return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fp_players(key):
+    """Canonical FantasyPros NFL player identity layer (independent of ECR coverage)."""
+    if not key:
+        return []
+    try:
+        return flatten_rows(fp_get("/nfl/players", key))
+    except Exception:
+        return []
+
+def _fp_player_meta(x):
+    name=x.get("player_name") or x.get("name") or " ".join(
+        y for y in [x.get("first_name") or x.get("player_first_name"), x.get("last_name") or x.get("player_last_name")] if y
+    ).strip()
+    pos=x.get("position_id") or x.get("primary_position") or x.get("position")
+    if not pos:
+        ps=x.get("positions")
+        if isinstance(ps,list) and ps: pos=ps[0]
+    team=x.get("team_id") or x.get("player_team_id") or x.get("team")
+    return {"fp_id":x.get("player_id") or x.get("id"),"name":name,"position":pos,"team":team}
+
+def build_fp_identity(rosters, sleeper_players, fp_player_rows, rankings):
+    """Map every rostered Sleeper player to a canonical FP identity where possible.
+
+    Matching order: exact normalized name -> exact name + position/team tie-break ->
+    conservative fuzzy match constrained by position. Ranked data is then aliased onto
+    the Sleeper name, so the rest of the app can keep using its existing value model.
+    """
+    fp=[]
+    by_name=defaultdict(list)
+    for raw in fp_player_rows:
+        m=_fp_player_meta(raw)
+        if not m["name"]: continue
+        m["key"]=normalize_player_name(m["name"])
+        fp.append(m); by_name[m["key"]].append(m)
+
+    rostered=[]
+    seen=set()
+    for r in rosters:
+        for pid in r.get("players") or []:
+            pid=str(pid)
+            if pid in seen: continue
+            seen.add(pid); rostered.append(pmeta(pid,sleeper_players))
+
+    identity={}; unresolved=[]
+    for sm in rostered:
+        sk=normalize_player_name(sm["name"]); candidates=by_name.get(sk,[])
+        match=None; method=None; confidence=0
+        if len(candidates)==1:
+            match=candidates[0]; method="exact name"; confidence=100
+        elif candidates:
+            scored=[]
+            for c in candidates:
+                score=90
+                if sm.get("position") and c.get("position")==sm.get("position"): score+=6
+                if sm.get("team") and c.get("team")==sm.get("team"): score+=4
+                scored.append((score,c))
+            score,match=max(scored,key=lambda z:z[0]); method="exact + metadata"; confidence=score
+        else:
+            # Only fuzzy-match plausible same-position players; threshold is deliberately strict.
+            pool=[c for c in fp if not sm.get("position") or c.get("position")==sm.get("position")]
+            best=None
+            for c in pool:
+                ratio=SequenceMatcher(None,sk,c["key"]).ratio()
+                bonus=.03 if sm.get("team") and c.get("team")==sm.get("team") else 0
+                score=ratio+bonus
+                if best is None or score>best[0]: best=(score,c)
+            if best and best[0]>=.91:
+                match=best[1]; method="fuzzy + position"; confidence=round(min(99,best[0]*100),1)
+        if match:
+            ranked=bool(rankings.get(match["key"]) or rankings.get(sk))
+            identity[sm["player_id"]]={**match,"sleeper_name":sm["name"],"method":method,"confidence":confidence,"ranked":ranked}
+            # Critical bridge: existing engine can look up by Sleeper name even when FP spelling differs.
+            if match["key"] in rankings and sk not in rankings:
+                rankings[sk]=dict(rankings[match["key"]])
+        else:
+            unresolved.append({"Player":sm["name"],"Pos":sm.get("position"),"NFL":sm.get("team"),"Sleeper ID":sm["player_id"],"Reason":"No safe FantasyPros identity match"})
+
+    ranked=sum(1 for m in identity.values() if m.get("ranked"))
+    return identity, unresolved, {
+        "total":len(rostered),"identified":len(identity),"ranked":ranked,
+        "fallback":max(0,len(rostered)-ranked),"unresolved":len(unresolved)
+    }
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fp_weekly_projections(season, week, key, scoring="PPR"):
@@ -649,6 +735,8 @@ rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
 fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
 rankings=fp_rankings(season,key,fp_scoring) if key else {}
 fp_diag=fp_diagnostics(season,key,fp_scoring)
+fp_player_rows=fp_players(key) if key else []
+fp_identity, fp_unresolved, coverage=build_fp_identity(rosters,players,fp_player_rows,rankings) if key else ({},[],{"total":sum(len(r.get("players") or []) for r in rosters),"identified":0,"ranked":0,"fallback":0,"unresolved":0})
 fp_active=bool(fp_diag.get("ok") and rankings)
 
 user_map={str(u.get("user_id")):u for u in users}
@@ -698,10 +786,13 @@ if st.sidebar.button("Change my team"):
     st.rerun()
 
 if fp_active:
-    matched=sum(1 for r in rosters for pid in (r.get("players") or []) if ranking_lookup(rankings,pmeta(pid,players)["name"]))
-    total_rostered=sum(len(r.get("players") or []) for r in rosters)
     st.sidebar.success(f"FantasyPros ACTIVE · {fp_scoring}")
-    st.sidebar.caption(f"{len(rankings)} ranking records · {matched}/{total_rostered} roster players matched")
+    st.sidebar.caption(
+        f"{coverage['identified']}/{coverage['total']} players identified · "
+        f"{coverage['ranked']} FP ranked · {coverage['fallback']} fallback valued"
+    )
+    if coverage["unresolved"]:
+        st.sidebar.warning(f"{coverage['unresolved']} player identities unresolved")
 else:
     st.sidebar.warning("Sleeper fallback model active")
     st.sidebar.caption(fp_diag.get("message") or "FantasyPros did not return usable ranking data.")
@@ -712,9 +803,17 @@ with st.sidebar.expander("FantasyPros diagnostics"):
         "HTTP status": fp_diag.get("status"),
         "Test rows": fp_diag.get("rows"),
         "Ranking records": len(rankings),
+        "FP player records": len(fp_player_rows),
+        "Roster players identified": f"{coverage['identified']}/{coverage['total']}",
+        "Roster players FP ranked": coverage['ranked'],
+        "Roster players fallback valued": coverage['fallback'],
+        "Unresolved identities": coverage['unresolved'],
         "Mode": "FantasyPros + Sleeper" if fp_active else "Sleeper fallback",
     })
     st.caption(fp_diag.get("message", ""))
+    if fp_unresolved:
+        with st.expander("Unresolved roster players"):
+            st.dataframe(pd.DataFrame(fp_unresolved),use_container_width=True,hide_index=True)
     if key and not fp_active:
         if st.button("Clear API caches and retry"):
             st.cache_data.clear()
@@ -826,7 +925,7 @@ elif page=="My Team":
 # ============================================================
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V6.1")
+    st.markdown("## Trade Centre V6.4")
     tab0,tab1,tab2,tab3=st.tabs(["Suggested trades","Targets","Partner finder","Analyser"])
 
     with tab0:
@@ -834,7 +933,7 @@ elif page=="Trade Centre":
             st.success(f"FantasyPros data verified: {len(rankings)} ranking records loaded. Trade values are using ECR + ADP + Sleeper league data.")
         else:
             st.warning(f"FantasyPros is NOT contributing to trade values right now. {fp_diag.get('message','')} Suggestions below use the Sleeper fallback model.")
-        st.markdown('<div class="notice"><b>Suggested Trades V6.1</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
+        st.markdown('<div class="notice"><b>Suggested Trades V6.4</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
         filt=st.selectbox("Show suggestions against",["All teams"]+[x for x in team_names if x!=my_name])
         suggestions=[]
         for partner in rosters:
