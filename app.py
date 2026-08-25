@@ -153,58 +153,91 @@ def flatten_rows(payload):
         if isinstance(v, list): return v
     return []
 
+
+def normalize_player_name(name):
+    """Normalize player names across Sleeper/FantasyPros formatting differences."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", str(name))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().replace("’", "'")
+    s = re.sub(r"[^a-z0-9\s']", " ", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", " ", s)
+    s = s.replace("'", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def ranking_record_name(x):
+    return (
+        x.get("player_name")
+        or x.get("name")
+        or " ".join(y for y in [x.get("player_first_name"), x.get("player_last_name")] if y).strip()
+    )
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fp_rankings(season, key, scoring="PPR"):
-    """Return separate FantasyPros ECR and ADP signals.
+    """Fetch broad FantasyPros ranking coverage and keep ECR/ADP as separate signals.
 
-    ECR is the expert-value layer; ADP is the market-price layer. They are
-    deliberately kept separate so disagreement can be surfaced rather than
-    averaged away.
+    Some API responses default to small pages. We therefore try large page sizes and
+    multiple pages, then merge/normalize names across positions.
     """
     if not key:
         return {}
-    out = {}
-    for pos in ["QB","RB","WR","TE","K","DST"]:
-        # Expert consensus
-        try:
-            payload = fp_get(
-                f"/nfl/{season}/consensus-rankings?position={pos}&scoring={scoring}",
-                key,
-            )
-            for x in flatten_rows(payload):
-                name = x.get("player_name") or x.get("name") or " ".join(
-                    y for y in [x.get("player_first_name"), x.get("player_last_name")] if y
-                ).strip()
-                if not name:
-                    continue
-                rec = out.setdefault(normalize_player_name(name), {})
-                rec["ecr"] = x.get("rank_ecr") or x.get("rank") or x.get("overall_rank")
-                rec["tier"] = x.get("tier")
-                # Some responses include ADP alongside ECR.
-                rec["adp"] = x.get("rank_adp") or x.get("adp") or rec.get("adp")
-        except Exception:
-            pass
 
-        # Explicit ADP request gives us a separate market-price signal.
-        try:
-            payload = fp_get(
-                f"/nfl/{season}/consensus-rankings?position={pos}&scoring={scoring}&type=ADP",
-                key,
+    out = {}
+
+    def merge_rows(rows, field_hint=None):
+        for x in rows:
+            name = ranking_record_name(x)
+            if not name:
+                continue
+            k = normalize_player_name(name)
+            if not k:
+                continue
+            rec = out.setdefault(k, {"name": name})
+            ecr = x.get("rank_ecr") or x.get("rank") or x.get("overall_rank")
+            adp = x.get("rank_adp") or x.get("adp")
+            if field_hint == "adp" and not adp:
+                adp = ecr
+            if ecr and field_hint != "adp":
+                rec["ecr"] = ecr
+            if adp:
+                rec["adp"] = adp
+            if x.get("tier") is not None:
+                rec["tier"] = x.get("tier")
+
+    def fetch_pages(url_base, field_hint=None):
+        seen = set()
+        # Try a large limit first, then page through. Harmless if backend ignores params.
+        for page in range(1, 9):
+            sep = "&" if "?" in url_base else "?"
+            url = f"{url_base}{sep}limit=500&page={page}"
+            try:
+                payload = fp_get(url, key)
+            except Exception:
+                break
+            rows = flatten_rows(payload)
+            if not rows:
+                break
+            signature = tuple(
+                normalize_player_name(ranking_record_name(x))
+                for x in rows[:10]
+                if ranking_record_name(x)
             )
-            for x in flatten_rows(payload):
-                name = x.get("player_name") or x.get("name") or " ".join(
-                    y for y in [x.get("player_first_name"), x.get("player_last_name")] if y
-                ).strip()
-                if not name:
-                    continue
-                rec = out.setdefault(normalize_player_name(name), {})
-                rec["adp"] = (
-                    x.get("rank_adp") or x.get("adp") or x.get("rank_ecr")
-                    or x.get("rank") or x.get("overall_rank")
-                )
-        except Exception:
-            pass
+            if signature in seen:
+                break
+            seen.add(signature)
+            merge_rows(rows, field_hint=field_hint)
+            if len(rows) < 10:
+                break
+
+    for pos in ["QB","RB","WR","TE","K","DST"]:
+        base = f"/nfl/{season}/consensus-rankings?position={pos}&scoring={scoring}"
+        fetch_pages(base)
+        fetch_pages(base + "&type=ADP", field_hint="adp")
+
     return out
+
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fp_weekly_projections(season, week, key, scoring="PPR"):
@@ -360,6 +393,16 @@ def player_value(meta, pick_map, rankings):
         elif d==2: depth_mult=1.01
         elif isinstance(d,(int,float)) and d>=4: depth_mult=.92
     return raw*pos_mult*age_mult*depth_mult*injury_mult(meta["injury"])
+
+
+def fantasy_relevant_roster_players(rosters, players):
+    ids=[]
+    for r in rosters:
+        for pid in r.get("players") or []:
+            p=players.get(str(pid),{})
+            if p.get("position") in {"QB","RB","WR","TE"}:
+                ids.append(str(pid))
+    return ids
 
 def roster_rows(roster, players, pick_map, rankings):
     starters={str(x) for x in (roster.get("starters") or [])}
@@ -648,6 +691,18 @@ key=fp_key()
 rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
 fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
 rankings=fp_rankings(season,key,fp_scoring) if key else {}
+
+# Coverage diagnostics: fantasy-relevant roster players only.
+relevant_ids=fantasy_relevant_roster_players(rosters,players)
+matched_ids=[]
+for pid in relevant_ids:
+    pm=pmeta(pid,players)
+    if normalize_player_name(pm["name"]) in rankings:
+        matched_ids.append(pid)
+fp_relevant_total=len(relevant_ids)
+fp_relevant_matched=len(matched_ids)
+fp_coverage_pct=round((fp_relevant_matched/fp_relevant_total)*100,1) if fp_relevant_total else 0.0
+
 fp_diag=fp_diagnostics(season,key,fp_scoring)
 fp_active=bool(fp_diag.get("ok") and rankings)
 
