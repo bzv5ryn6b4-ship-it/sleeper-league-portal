@@ -186,6 +186,19 @@ def injury_mult(s):
     s=(s or "").lower()
     return {"out":.70,"ir":.70,"pup":.74,"doubtful":.82,"questionable":.93}.get(s,1.0)
 
+def is_current_nfl_player(raw_player):
+    """Filter stale historical Sleeper records from waiver/free-agent lists."""
+    if not raw_player:
+        return False
+    if raw_player.get("active") is not True:
+        return False
+    if not raw_player.get("team"):
+        return False
+    status=str(raw_player.get("status") or "").lower()
+    if status in {"retired","inactive"}:
+        return False
+    return True
+
 def pick_value(pick_no):
     if not pick_no: return 0.0
     p=max(1,float(pick_no))
@@ -643,7 +656,7 @@ elif page=="Trade Centre":
 
 elif page=="Waivers":
     st.markdown("## Waiver Engine V2.1")
-    st.caption("Recalibrated so market heat helps identify movement without turning deep reserves into fake must-adds.")
+    st.caption("Recalibrated so market heat helps identify movement while stale, retired and teamless historical records are filtered out.")
     rostered={str(pid) for r in rosters for pid in (r.get("players") or [])}
     try:
         adds=sleeper_get("/players/nfl/trending/add?lookback_hours=24&limit=100"); drops=sleeper_get("/players/nfl/trending/drop?lookback_hours=24&limit=100")
@@ -652,7 +665,7 @@ elif page=="Waivers":
     myneed=needs(my_roster,players,pick_map,rankings); rows=[]
     for pid,p in players.items():
         pid=str(pid)
-        if pid in rostered or p.get("active") is False or p.get("position") not in {"QB","RB","WR","TE"}: continue
+        if pid in rostered or not is_current_nfl_player(p) or p.get("position") not in {"QB","RB","WR","TE"}: continue
         m=pmeta(pid,players); basev=player_value(m,pick_map,rankings); adds24=amap.get(pid,0); drops24=dmap.get(pid,0)
         if basev<4.5 and adds24<50: continue
         trend=min(5.0,math.log1p(adds24)*.9)-min(3.0,math.log1p(drops24)*.6)

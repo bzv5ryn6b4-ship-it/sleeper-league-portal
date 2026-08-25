@@ -16,3 +16,10 @@
 - nonsense cross-position TE suggestions are blocked
 
 Sleeper player metadata is cached for 24 hours.
+
+
+## V5.2 waiver hotfix
+- Requires `active == True` for waiver/free-agent candidates.
+- Requires a current NFL team.
+- Excludes retired/inactive historical records.
+- Prevents stale Sleeper records such as Todd Gurley appearing as waiver recommendations.
