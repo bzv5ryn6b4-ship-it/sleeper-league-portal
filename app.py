@@ -2,6 +2,8 @@
 import json
 import math
 import itertools
+import re
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 
@@ -100,9 +102,48 @@ def fp_key():
 def fp_get(path, key):
     if not key:
         return None
-    r = requests.get(f"{FP}{path}", headers={"x-api-key":key}, timeout=20)
+    r = requests.get(
+        f"{FP}{path}",
+        headers={"x-api-key": key, "User-Agent": "SleeperGM/6.1"},
+        timeout=20,
+    )
     r.raise_for_status()
     return r.json()
+
+def normalize_player_name(name):
+    """Normalize Sleeper/FantasyPros names so suffixes and punctuation do not break matches."""
+    text=unicodedata.normalize("NFKD", str(name or "")).encode("ascii","ignore").decode("ascii")
+    text=text.lower().replace("’", "'")
+    text=re.sub(r"[^a-z0-9 ]+", " ", text)
+    parts=[x for x in text.split() if x not in {"jr","sr","ii","iii","iv","v"}]
+    return " ".join(parts)
+
+def ranking_lookup(rankings, name):
+    if not rankings:
+        return {}
+    return rankings.get(normalize_player_name(name), {})
+
+def fp_diagnostics(season, key, scoring="PPR"):
+    """Make a small uncached request and report whether FantasyPros is truly returning usable rows."""
+    diag={"key_present":bool(key),"ok":False,"status":None,"rows":0,"message":"No API key found"}
+    if not key:
+        return diag
+    try:
+        url=f"{FP}/nfl/{season}/consensus-rankings?position=RB&scoring={scoring}"
+        r=requests.get(url,headers={"x-api-key":key,"User-Agent":"SleeperGM/6.1"},timeout=20)
+        diag["status"]=r.status_code
+        if not r.ok:
+            diag["message"]=f"FantasyPros HTTP {r.status_code}: {r.text[:180]}"
+            return diag
+        payload=r.json()
+        rows=flatten_rows(payload)
+        diag["rows"]=len(rows)
+        diag["ok"]=len(rows)>0
+        diag["message"]=(f"FantasyPros returned {len(rows)} RB ranking rows" if rows else "FantasyPros responded, but no ranking rows were found")
+        return diag
+    except Exception as e:
+        diag["message"]=f"FantasyPros request failed: {e}"
+        return diag
 
 def flatten_rows(payload):
     if payload is None: return []
@@ -136,7 +177,7 @@ def fp_rankings(season, key, scoring="PPR"):
                 ).strip()
                 if not name:
                     continue
-                rec = out.setdefault(name.lower(), {})
+                rec = out.setdefault(normalize_player_name(name), {})
                 rec["ecr"] = x.get("rank_ecr") or x.get("rank") or x.get("overall_rank")
                 rec["tier"] = x.get("tier")
                 # Some responses include ADP alongside ECR.
@@ -156,7 +197,7 @@ def fp_rankings(season, key, scoring="PPR"):
                 ).strip()
                 if not name:
                     continue
-                rec = out.setdefault(name.lower(), {})
+                rec = out.setdefault(normalize_player_name(name), {})
                 rec["adp"] = (
                     x.get("rank_adp") or x.get("adp") or x.get("rank_ecr")
                     or x.get("rank") or x.get("overall_rank")
@@ -188,7 +229,7 @@ def fp_weekly_projections(season, week, key, scoring="PPR"):
                 or stats.get("points_ppr" if scoring=="PPR" else ("points_half" if scoring=="HALF" else "points"))
             )
             if name:
-                try: out[name.lower()]=float(pts)
+                try: out[normalize_player_name(name)]=float(pts)
                 except Exception: pass
     return out
 
@@ -294,8 +335,8 @@ def consolidation_premium(combo):
     return 1.04
 
 def player_value(meta, pick_map, rankings):
-    name_key=(meta["name"] or "").lower()
-    ext, disagreement=external_signal(rankings.get(name_key,{})) if rankings else (0.0,0.0)
+    name_key=normalize_player_name(meta["name"])
+    ext, disagreement=external_signal(ranking_lookup(rankings, meta["name"])) if rankings else (0.0,0.0)
     drafted=pick_value(pick_map.get(meta["player_id"]))
     sleeper=search_value(meta.get("search_rank"))
     if ext:
@@ -327,7 +368,7 @@ def roster_rows(roster, players, pick_map, rankings):
         m=pmeta(pid,players)
         m["starter"]=str(pid) in starters
         m["value"]=round(player_value(m,pick_map,rankings),2)
-        rr=rankings.get((m["name"] or "").lower(),{}) if rankings else {}
+        rr=ranking_lookup(rankings,m["name"]) if rankings else {}
         m["ecr"]=rr.get("ecr")
         m["adp"]=rr.get("adp")
         _,dis=external_signal(rr)
@@ -447,7 +488,7 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             adj_gv=gv*consolidation_premium(g)
             adj_rv=rv*consolidation_premium(rc)
             fairness_gap=abs(adj_gv-adj_rv)/max(adj_gv,adj_rv)
-            if fairness_gap>.24:
+            if fairness_gap>.18:
                 continue
 
             mn=roster_after_trade(my_roster,[x["player_id"] for x in g],[x["player_id"] for x in rc])
@@ -461,7 +502,7 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             tg += sum(their_need.get(x["position"],0) for x in g)*.07
 
             # Suggested trades should be plausible for BOTH managers.
-            if mg < .35 or tg < .20:
+            if mg < .55 or tg < .45:
                 continue
 
             # Asset-quality check: two mediocre pieces cannot simply add up to
@@ -469,7 +510,7 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             gq=asset_quality(g)
             rq=asset_quality(rc)
             quality_gap=abs(gq-rq)/max(gq,rq)
-            if quality_gap>.27:
+            if quality_gap>.20:
                 continue
 
             fair_pct=max(0,round(100-fairness_gap*100))
@@ -478,17 +519,24 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             balance=max(0.0,1.0-fairness_gap)
             mutual=max(0.0,min(1.0,(min(mg,tg)+1.5)/5.5))
             quality=max(0.0,1.0-quality_gap)
-            acceptance=100*(balance*.48 + mutual*.34 + quality*.18)
+            acceptance=100*(balance*.42 + mutual*.38 + quality*.20) - 8
 
             # Penalise multi-player offers when the receiving manager is giving
             # away the clear best player.
             if len(g)==2 and len(rc)==1:
-                acceptance-=8
+                acceptance-=15
             elif len(g)==1 and len(rc)==2:
-                acceptance-=5
-            acceptance=max(5,min(92,round(acceptance)))
+                acceptance-=10
+            # Managers rarely trade the clear best player without a meaningful overpay.
+            best_g=max(x["value"] for x in g)
+            best_r=max(x["value"] for x in rc)
+            if len(g)==2 and len(rc)==1 and best_r > best_g*1.22:
+                acceptance-=10
+            elif len(g)==1 and len(rc)==2 and best_g > best_r*1.22:
+                acceptance-=7
+            acceptance=max(5,min(88,round(acceptance)))
 
-            if acceptance < 43:
+            if acceptance < 52:
                 continue
 
             why=[]
@@ -565,7 +613,7 @@ def optimize_lineup(roster, players, pick_map, rankings, slots, projections):
         return False
 
     for r in remaining:
-        proj=projections.get((r["name"] or "").lower())
+        proj=projections.get(normalize_player_name(r["name"]))
         r["lineup_score"] = proj if proj is not None else r["value"]/5.0
 
     for slot in slots:
@@ -600,6 +648,8 @@ key=fp_key()
 rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
 fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
 rankings=fp_rankings(season,key,fp_scoring) if key else {}
+fp_diag=fp_diagnostics(season,key,fp_scoring)
+fp_active=bool(fp_diag.get("ok") and rankings)
 
 user_map={str(u.get("user_id")):u for u in users}
 roster_names={}
@@ -647,12 +697,28 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-if key:
-    st.sidebar.success(f"FantasyPros connected · {fp_scoring}")
-    st.sidebar.caption("ECR + ADP are used as separate expert and market signals.")
+if fp_active:
+    matched=sum(1 for r in rosters for pid in (r.get("players") or []) if ranking_lookup(rankings,pmeta(pid,players)["name"]))
+    total_rostered=sum(len(r.get("players") or []) for r in rosters)
+    st.sidebar.success(f"FantasyPros ACTIVE · {fp_scoring}")
+    st.sidebar.caption(f"{len(rankings)} ranking records · {matched}/{total_rostered} roster players matched")
 else:
-    st.sidebar.info("Sleeper fallback model active")
-    st.sidebar.caption("Add FANTASYPROS_API_KEY in Streamlit Secrets to enable ECR + ADP market intelligence.")
+    st.sidebar.warning("Sleeper fallback model active")
+    st.sidebar.caption(fp_diag.get("message") or "FantasyPros did not return usable ranking data.")
+
+with st.sidebar.expander("FantasyPros diagnostics"):
+    st.write({
+        "Key detected": bool(key),
+        "HTTP status": fp_diag.get("status"),
+        "Test rows": fp_diag.get("rows"),
+        "Ranking records": len(rankings),
+        "Mode": "FantasyPros + Sleeper" if fp_active else "Sleeper fallback",
+    })
+    st.caption(fp_diag.get("message", ""))
+    if key and not fp_active:
+        if st.button("Clear API caches and retry"):
+            st.cache_data.clear()
+            st.rerun()
 
 PAGES=["Home","Power Rankings","My Team","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
 page=st.sidebar.radio("Navigate",PAGES)
@@ -760,11 +826,15 @@ elif page=="My Team":
 # ============================================================
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V3")
+    st.markdown("## Trade Centre V6.1")
     tab0,tab1,tab2,tab3=st.tabs(["Suggested trades","Targets","Partner finder","Analyser"])
 
     with tab0:
-        st.markdown('<div class="notice"><b>Suggested Trades V3</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
+        if fp_active:
+            st.success(f"FantasyPros data verified: {len(rankings)} ranking records loaded. Trade values are using ECR + ADP + Sleeper league data.")
+        else:
+            st.warning(f"FantasyPros is NOT contributing to trade values right now. {fp_diag.get('message','')} Suggestions below use the Sleeper fallback model.")
+        st.markdown('<div class="notice"><b>Suggested Trades V6.1</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
         filt=st.selectbox("Show suggestions against",["All teams"]+[x for x in team_names if x!=my_name])
         suggestions=[]
         for partner in rosters:
