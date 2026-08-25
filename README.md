@@ -1,32 +1,18 @@
-# Sleeper GM V5
-
-V5 upgrades the analysis engine.
+# Sleeper GM V5.1 — Trade Suggestions + Waiver Calibration
 
 ## Added
-- Power Rankings V2
-- Team need and surplus model
-- Trade target finder
-- Trade partner fit finder
-- Roster-adjusted trade analyser
-- Waiver Engine V2
-- Add/drop suggestions
-- Matchup positional edge table
-- Optional FantasyPros integration for:
-  - consensus rankings
-  - weekly projections
-  - roster-relevant player news
+- Suggested Trades tab
+- 1-for-1, 2-for-1 and 1-for-2 auto-generated deals
+- fairness threshold
+- simulated roster improvement for both teams
+- trade-fit explanation
 
-## Optional FantasyPros API key
+## Recalibrated
+- Sleeper search rank is now only a weak supporting signal
+- draft capital is blended rather than allowed to dominate
+- depth-chart penalties for deep reserves
+- trending add/drop activity is capped
+- waiver add/drop suggestions compare base player value to bench value, not heat-inflated scores
+- nonsense cross-position TE suggestions are blocked
 
-In Streamlit Community Cloud, open app settings -> Secrets and add:
-
-```toml
-FANTASYPROS_API_KEY = "your_key_here"
-```
-
-Without the key, the app still works using Sleeper data + your league's actual draft market.
-
-## Files
-- app.py
-- requirements.txt
-- .streamlit/config.toml
+Sleeper player metadata is cached for 24 hours.

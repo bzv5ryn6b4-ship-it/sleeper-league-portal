@@ -1,6 +1,7 @@
 
 import json
 import math
+import itertools
 from collections import Counter, defaultdict
 from datetime import datetime
 
@@ -187,37 +188,44 @@ def injury_mult(s):
 
 def pick_value(pick_no):
     if not pick_no: return 0.0
-    return 118/(max(1,float(pick_no))**0.48)
+    p=max(1,float(pick_no))
+    return 92/(p**0.38)
 
 def search_value(rank):
     try: r=float(rank)
-    except Exception: return 4.0
-    return max(2.5,80/(max(1,r)**0.33))
+    except Exception: return 0.0
+    if r<=0: return 0.0
+    return max(0.0,38/(r**0.28))
 
 def ecr_value(ecr):
-    try:
-        e=float(ecr)
-    except Exception:
-        return 0.0
-    return max(4.0, 118/(max(1,e)**0.44))
+    try: e=float(ecr)
+    except Exception: return 0.0
+    return max(3.0,100/(max(1,e)**0.34))
 
 def player_value(meta, pick_map, rankings):
     name_key=(meta["name"] or "").lower()
-    rnk = rankings.get(name_key, {})
-    live = ecr_value(rnk.get("ecr")) if rankings else 0.0
-    drafted = pick_value(pick_map.get(meta["player_id"]))
-    sleeper = search_value(meta["search_rank"])*.78
-
-    raw = max(live, drafted, sleeper)
-    pos_mult={"RB":1.08,"WR":1.0,"TE":.97,"QB":.90,"K":.32,"DEF":.35}.get(meta["position"],.65)
-
+    live=ecr_value(rankings.get(name_key,{}).get("ecr")) if rankings else 0.0
+    drafted=pick_value(pick_map.get(meta["player_id"]))
+    sleeper=search_value(meta.get("search_rank"))
+    if live:
+        raw=live*.62+drafted*.28+sleeper*.10
+    elif drafted:
+        raw=drafted*.78+sleeper*.22
+    else:
+        raw=sleeper
+    pos_mult={"RB":1.05,"WR":1.0,"TE":.95,"QB":.88,"K":.28,"DEF":.30}.get(meta["position"],.60)
     age_mult=1.0
     age=meta["age"]
     if meta["position"] in {"RB","WR","TE"} and isinstance(age,(int,float)):
-        if age<=24: age_mult=1.05
-        elif age>=31: age_mult=.93
-
-    return raw*pos_mult*age_mult*injury_mult(meta["injury"])
+        if age<=24: age_mult=1.04
+        elif age>=31: age_mult=.94
+    depth_mult=1.0
+    d=meta.get("depth")
+    if meta["position"] in {"RB","WR","TE"}:
+        if d==1: depth_mult=1.05
+        elif d==2: depth_mult=1.01
+        elif isinstance(d,(int,float)) and d>=4: depth_mult=.92
+    return raw*pos_mult*age_mult*depth_mult*injury_mult(meta["injury"])
 
 def roster_rows(roster, players, pick_map, rankings):
     starters={str(x) for x in (roster.get("starters") or [])}
@@ -286,6 +294,62 @@ def surplus(roster, players, pick_map, rankings):
         extras=max(0,len(arr)-b)
         quality=sum(arr[b:b+extras]) if extras else 0
         out[pos]=quality + extras*3
+    return out
+
+
+def team_utility(roster, players, pick_map, rankings):
+    raw,_=raw_power(roster,players,pick_map,rankings)
+    return raw-sum(needs(roster,players,pick_map,rankings).values())*.35
+
+def roster_after_trade(roster, give_ids, receive_ids):
+    new=dict(roster)
+    cur=[str(x) for x in (roster.get("players") or [])]
+    cur=[x for x in cur if x not in set(give_ids)]
+    cur.extend([str(x) for x in receive_ids if str(x) not in cur])
+    new["players"]=cur
+    return new
+
+def combo_label(combo):
+    return " + ".join(x["name"] for x in combo)
+
+def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, max_results=10):
+    mine=[x for x in roster_rows(my_roster,players,pick_map,rankings) if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
+    theirs=[x for x in roster_rows(partner,players,pick_map,rankings) if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
+    my_need=needs(my_roster,players,pick_map,rankings); their_need=needs(partner,players,pick_map,rankings)
+    my_sur=surplus(my_roster,players,pick_map,rankings); their_sur=surplus(partner,players,pick_map,rankings)
+    base_me=team_utility(my_roster,players,pick_map,rankings); base_them=team_utility(partner,players,pick_map,rankings)
+    give=[[x] for x in mine]; recv=[[x] for x in theirs]
+    mp=sorted(mine,key=lambda x:(my_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:9]
+    tp=sorted(theirs,key=lambda x:(their_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:9]
+    give += [list(c) for c in itertools.combinations(mp,2)]
+    recv += [list(c) for c in itertools.combinations(tp,2)]
+    results=[]
+    for g in give:
+        gv=sum(x["value"] for x in g)
+        for rc in recv:
+            if len(g)==2 and len(rc)==2: continue
+            rv=sum(x["value"] for x in rc)
+            if not gv or not rv: continue
+            fairness=abs(gv-rv)/max(gv,rv)
+            if fairness>.30: continue
+            mn=roster_after_trade(my_roster,[x["player_id"] for x in g],[x["player_id"] for x in rc])
+            tn=roster_after_trade(partner,[x["player_id"] for x in rc],[x["player_id"] for x in g])
+            mg=team_utility(mn,players,pick_map,rankings)-base_me + sum(my_need.get(x["position"],0) for x in rc)*.10
+            tg=team_utility(tn,players,pick_map,rankings)-base_them + sum(their_need.get(x["position"],0) for x in g)*.10
+            if mg < -1 or tg < -3: continue
+            why=[]
+            for pos in {x["position"] for x in rc}:
+                if my_need.get(pos,0)>=4: why.append(f"addresses your {pos} need")
+            for pos in {x["position"] for x in g}:
+                if their_need.get(pos,0)>=4: why.append(f"helps their {pos} need")
+            score=mg*2.2+tg*.8+(100-fairness*100)*.15
+            results.append({"You send":combo_label(g),"You receive":combo_label(rc),"Send value":round(gv,1),"Receive value":round(rv,1),"Your improvement":round(mg,1),"Their improvement":round(tg,1),"Fairness":round(100-fairness*100),"Why":"; ".join(why) or "balanced value / roster fit","_score":score})
+    seen=set(); out=[]
+    for row in sorted(results,key=lambda x:x["_score"],reverse=True):
+        k=(row["You send"],row["You receive"])
+        if k in seen: continue
+        seen.add(k); out.append(row)
+        if len(out)>=max_results: break
     return out
 
 def card(label,value,sub=""):
@@ -462,7 +526,7 @@ if page=="Home":
 # ============================================================
 
 elif page=="Power Rankings":
-    st.markdown("## Power Rankings V2")
+    st.markdown("## Power Rankings V2.1")
     st.caption("Starter strength first, then meaningful RB/WR depth. Kicker and D/ST have minimal weight.")
 
     table=[]
@@ -513,142 +577,104 @@ elif page=="My Team":
 # ============================================================
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V2")
-    tab1,tab2,tab3=st.tabs(["Targets","Partner finder","Analyser"])
+    st.markdown("## Trade Centre V2.1")
+    tab0,tab1,tab2,tab3=st.tabs(["Suggested trades","Targets","Partner finder","Analyser"])
+
+    with tab0:
+        st.markdown('<div class="notice"><b>Suggested Trades</b> scans every other roster for 1-for-1, 2-for-1 and 1-for-2 deals. It rejects lopsided deals and scores whether both rosters actually improve.</div>',unsafe_allow_html=True)
+        filt=st.selectbox("Show suggestions against",["All teams"]+[x for x in team_names if x!=my_name])
+        suggestions=[]
+        for partner in rosters:
+            if partner["roster_id"]==my_rid: continue
+            if filt!="All teams" and roster_names[partner["roster_id"]]!=filt: continue
+            for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,8):
+                row["Partner"]=roster_names[partner["roster_id"]]
+                suggestions.append(row)
+        if suggestions:
+            sdf=pd.DataFrame(suggestions).sort_values(["Your improvement","Fairness"],ascending=[False,False])
+            cols=["Partner","You send","You receive","Send value","Receive value","Your improvement","Their improvement","Fairness","Why"]
+            st.dataframe(sdf[cols].head(30),use_container_width=True,hide_index=True)
+            st.markdown("### Best 3 to investigate")
+            for _,r in sdf.head(3).iterrows():
+                st.markdown(f"**{r['Partner']}** — Send **{r['You send']}** for **{r['You receive']}**  \nYour improvement **{r['Your improvement']:+.1f}** · Their improvement **{r['Their improvement']:+.1f}** · Fairness **{int(r['Fairness'])}%**  \n*{r['Why']}*")
+        else:
+            st.info("No deal cleared the fairness and roster-improvement thresholds. The engine will not manufacture a trade just to fill the page.")
 
     with tab1:
-        myneeds=needs(my_roster,players,pick_map,rankings)
-        needpos=max(myneeds,key=myneeds.get)
-        st.markdown(f'<div class="notice">Your biggest modeled need is <b>{needpos}</b>. These targets come from teams with usable depth there.</div>',unsafe_allow_html=True)
-
+        myneeds=needs(my_roster,players,pick_map,rankings); needpos=max(myneeds,key=myneeds.get)
         candidates=[]
         for r in rosters:
             if r["roster_id"]==my_rid: continue
             rows=[x for x in roster_rows(r,players,pick_map,rankings) if x["position"]==needpos]
-            tneed=needs(r,players,pick_map,rankings).get(needpos,0)
-            tsurplus=surplus(r,players,pick_map,rankings).get(needpos,0)
+            tneed=needs(r,players,pick_map,rankings).get(needpos,0); tsur=surplus(r,players,pick_map,rankings).get(needpos,0)
             for x in rows:
-                targetability=x["value"] + tsurplus*.35 - tneed*.40
-                candidates.append({
-                    "Target":x["name"],"Pos":needpos,"NFL":x["team"],"Owner":roster_names[r["roster_id"]],
-                    "Value":round(x["value"],1),"Their surplus":round(tsurplus,1),"Targetability":round(targetability,1)
-                })
-        if candidates:
-            st.dataframe(pd.DataFrame(candidates).sort_values("Targetability",ascending=False).head(30),use_container_width=True,hide_index=True)
+                candidates.append({"Target":x["name"],"Pos":needpos,"NFL":x["team"],"Owner":roster_names[r["roster_id"]],"Value":round(x["value"],1),"Targetability":round(x["value"]+tsur*.25-tneed*.35,1)})
+        if candidates: st.dataframe(pd.DataFrame(candidates).sort_values("Targetability",ascending=False).head(30),use_container_width=True,hide_index=True)
 
     with tab2:
-        mysur=surplus(my_roster,players,pick_map,rankings)
-        rows=[]
+        mysur=surplus(my_roster,players,pick_map,rankings); myneed=needs(my_roster,players,pick_map,rankings); rows=[]
         for r in rosters:
             if r["roster_id"]==my_rid: continue
-            theirneed=needs(r,players,pick_map,rankings)
-            theirsur=surplus(r,players,pick_map,rankings)
-            fit=0; reasons=[]
+            tn=needs(r,players,pick_map,rankings); ts=surplus(r,players,pick_map,rankings); fit=0; why=[]
             for pos in ["QB","RB","WR","TE"]:
-                a=mysur.get(pos,0)*theirneed.get(pos,0)
-                b=theirsur.get(pos,0)*needs(my_roster,players,pick_map,rankings).get(pos,0)
-                if a>10:
-                    fit+=a; reasons.append(f"You can help their {pos}")
-                if b>10:
-                    fit+=b; reasons.append(f"They can help your {pos}")
-            rows.append({"Team":roster_names[r["roster_id"]],"Fit score":round(fit,1),"Why":" · ".join(reasons) or "Weak fit"})
+                a=mysur.get(pos,0)*tn.get(pos,0); b=ts.get(pos,0)*myneed.get(pos,0)
+                if a>8: fit+=a; why.append(f"you can help their {pos}")
+                if b>8: fit+=b; why.append(f"they can help your {pos}")
+            rows.append({"Team":roster_names[r["roster_id"]],"Fit score":round(fit,1),"Why":" · ".join(why) or "weak fit"})
         st.dataframe(pd.DataFrame(rows).sort_values("Fit score",ascending=False),use_container_width=True,hide_index=True)
 
     with tab3:
-        partner_name=st.selectbox("Trade partner",[x for x in team_names if x!=my_name])
-        partner_rid=team_options[partner_name]
-        partner=next(r for r in rosters if r["roster_id"]==partner_rid)
-
-        mine={x["name"]:x for x in roster_rows(my_roster,players,pick_map,rankings)}
-        theirs={x["name"]:x for x in roster_rows(partner,players,pick_map,rankings)}
-
-        c1,c2=st.columns(2)
-        with c1: give=st.multiselect("You give",list(mine.keys()))
-        with c2: receive=st.multiselect("You receive",list(theirs.keys()))
-
-        gv=sum(mine[x]["value"] for x in give)
-        rv=sum(theirs[x]["value"] for x in receive)
-
-        myneed=needs(my_roster,players,pick_map,rankings)
-        theirneed=needs(partner,players,pick_map,rankings)
-
-        myfit=sum(myneed.get(theirs[x]["position"],0)*.12 for x in receive)
-        theirfit=sum(theirneed.get(mine[x]["position"],0)*.12 for x in give)
-
-        your_edge=(rv+myfit)-gv
-        their_edge=(gv+theirfit)-rv
-
-        a,b,c=st.columns(3)
-        a.metric("You send",round(gv,1))
-        b.metric("You receive",round(rv,1))
-        c.metric("Roster-adjusted edge",round(your_edge,1))
-
+        partner_name=st.selectbox("Trade partner",[x for x in team_names if x!=my_name],key="manualpartner")
+        partner_rid=team_options[partner_name]; partner=next(r for r in rosters if r["roster_id"]==partner_rid)
+        mine={x["name"]:x for x in roster_rows(my_roster,players,pick_map,rankings)}; theirs={x["name"]:x for x in roster_rows(partner,players,pick_map,rankings)}
+        a,b=st.columns(2)
+        with a: give=st.multiselect("You give",list(mine.keys()))
+        with b: receive=st.multiselect("You receive",list(theirs.keys()))
+        gv=sum(mine[x]["value"] for x in give); rv=sum(theirs[x]["value"] for x in receive)
+        c1,c2,c3=st.columns(3); c1.metric("You send",round(gv,1)); c2.metric("You receive",round(rv,1)); c3.metric("Raw edge",round(rv-gv,1))
         if give or receive:
-            if your_edge>5 and their_edge>-8:
-                st.success("Strong structure for you and still plausible for them.")
-            elif your_edge<-5:
-                st.error("You are paying too much.")
-            else:
-                st.info("Balanced enough that role, injury and upside should decide it.")
+            if rv-gv>4: st.success("Value leans your way.")
+            elif rv-gv<-4: st.error("You are paying too much.")
+            else: st.info("Close enough that role, upside and current news should decide it.")
 
 # ============================================================
 # WAIVER ENGINE V2
 # ============================================================
 
 elif page=="Waivers":
-    st.markdown("## Waiver Engine V2")
+    st.markdown("## Waiver Engine V2.1")
+    st.caption("Recalibrated so market heat helps identify movement without turning deep reserves into fake must-adds.")
     rostered={str(pid) for r in rosters for pid in (r.get("players") or [])}
     try:
-        adds=sleeper_get("/players/nfl/trending/add?lookback_hours=24&limit=100")
-        drops=sleeper_get("/players/nfl/trending/drop?lookback_hours=24&limit=100")
-    except Exception:
-        adds,drops=[],[]
-
-    amap={str(x["player_id"]):x.get("count",0) for x in adds}
-    dmap={str(x["player_id"]):x.get("count",0) for x in drops}
-    myneed=needs(my_roster,players,pick_map,rankings)
-
-    rows=[]
+        adds=sleeper_get("/players/nfl/trending/add?lookback_hours=24&limit=100"); drops=sleeper_get("/players/nfl/trending/drop?lookback_hours=24&limit=100")
+    except Exception: adds,drops=[],[]
+    amap={str(x["player_id"]):x.get("count",0) for x in adds}; dmap={str(x["player_id"]):x.get("count",0) for x in drops}
+    myneed=needs(my_roster,players,pick_map,rankings); rows=[]
     for pid,p in players.items():
         pid=str(pid)
-        if pid in rostered or p.get("active") is False: continue
-        if p.get("position") not in {"QB","RB","WR","TE","K","DEF"}: continue
-        m=pmeta(pid,players)
-        basev=player_value(m,pick_map,rankings)
-        addheat=math.log1p(amap.get(pid,0))*3.2
-        dropheat=math.log1p(dmap.get(pid,0))*1.2
-        depthbonus=0
-        if m["position"] in {"RB","WR","TE"} and m["depth"] in [1,2]:
-            depthbonus=5 if m["depth"]==1 else 2.5
-        needbonus=myneed.get(m["position"],0)*.25
-        score=basev+addheat-dropheat+depthbonus+needbonus
-
-        rows.append({
-            "Player":m["name"],"Pos":m["position"],"NFL":m["team"],"Injury":m["injury"],
-            "Depth":m["depth"],"Adds 24h":amap.get(pid,0),"Drops 24h":dmap.get(pid,0),
-            "Roster fit":round(needbonus,1),"Waiver score":round(score,1)
-        })
-
-    df=pd.DataFrame(rows)
-    posf=st.multiselect("Position",["RB","WR","TE","QB","K","DEF"],default=["RB","WR","TE"])
-    if posf: df=df[df["Pos"].isin(posf)]
-    st.dataframe(df.sort_values(["Waiver score","Adds 24h"],ascending=False).head(100),use_container_width=True,hide_index=True)
-
+        if pid in rostered or p.get("active") is False or p.get("position") not in {"QB","RB","WR","TE"}: continue
+        m=pmeta(pid,players); basev=player_value(m,pick_map,rankings); adds24=amap.get(pid,0); drops24=dmap.get(pid,0)
+        if basev<4.5 and adds24<50: continue
+        trend=min(5.0,math.log1p(adds24)*.9)-min(3.0,math.log1p(drops24)*.6)
+        opp=3 if m["depth"]==1 else 1.5 if m["depth"]==2 else -1.5 if isinstance(m["depth"],(int,float)) and m["depth"]>=4 else 0
+        fit=min(3.0,myneed.get(m["position"],0)*.12); score=basev+trend+opp+fit
+        rows.append({"Player":m["name"],"Pos":m["position"],"NFL":m["team"],"Injury":m["injury"],"Depth":m["depth"],"Adds 24h":adds24,"Drops 24h":drops24,"Base value":round(basev,1),"Roster fit":round(fit,1),"Waiver score":round(score,1)})
+    df=pd.DataFrame(rows); posf=st.multiselect("Position",["RB","WR","TE","QB"],default=["RB","WR","TE"])
+    if posf and not df.empty: df=df[df["Pos"].isin(posf)]
+    if not df.empty: st.dataframe(df.sort_values(["Waiver score","Base value"],ascending=False).head(75),use_container_width=True,hide_index=True)
     st.markdown("### Add / drop suggestions")
-    bench=sorted([x for x in roster_rows(my_roster,players,pick_map,rankings) if not x["starter"] and x["position"] in {"RB","WR","TE","QB"}],key=lambda x:x["value"])
-    topfa=df.sort_values("Waiver score",ascending=False).head(10)
-
+    bench=[x for x in roster_rows(my_roster,players,pick_map,rankings) if not x["starter"] and x["position"] in {"QB","RB","WR","TE"}]
     suggestions=[]
-    for _,fa in topfa.iterrows():
-        same=[x for x in bench if x["position"]==fa["Pos"]]
-        drop=same[0] if same else (bench[0] if bench else None)
-        if not drop: continue
-        upgrade=fa["Waiver score"]-drop["value"]
-        suggestions.append({
-            "Add":fa["Player"],"Drop":drop["name"],"Pos":fa["Pos"],"Estimated upgrade":round(upgrade,1)
-        })
-    if suggestions:
-        st.dataframe(pd.DataFrame(suggestions).sort_values("Estimated upgrade",ascending=False),use_container_width=True,hide_index=True)
+    if not df.empty:
+        for _,fa in df.sort_values("Waiver score",ascending=False).head(25).iterrows():
+            same=[x for x in bench if x["position"]==fa["Pos"]]; pool=same if same else bench
+            if not pool: continue
+            drop=min(pool,key=lambda x:x["value"]); upgrade=fa["Base value"]-drop["value"]
+            if upgrade<1.5: continue
+            if fa["Pos"]=="TE" and drop["position"]!="TE": continue
+            suggestions.append({"Add":fa["Player"],"Drop":drop["name"],"Pos":fa["Pos"],"FA value":fa["Base value"],"Drop value":round(drop["value"],1),"Estimated upgrade":round(upgrade,1)})
+    if suggestions: st.dataframe(pd.DataFrame(suggestions).sort_values("Estimated upgrade",ascending=False).head(12),use_container_width=True,hide_index=True)
+    else: st.success("No free agent clears the current upgrade threshold over your bench. Holding is a valid move.")
 
 # ============================================================
 # MATCHUP SCOUT
