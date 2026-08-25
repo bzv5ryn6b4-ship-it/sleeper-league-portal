@@ -1,18 +1,32 @@
-# Sleeper GM V4
+# Sleeper GM V5
 
-Cleaner visual overhaul plus a proper one-time **My Team** setup.
+V5 upgrades the analysis engine.
 
-## Key fixes
-- App no longer assumes the first roster is yours.
-- First launch forces you to choose your team.
-- Your roster ID is then persisted in the URL as `?myteam=<roster_id>`.
-- Sidebar shows your selected team with a **Change my team** button.
-- Card-based roster views replace most ugly raw tables.
-- Cleaner hierarchy and less visual clutter.
+## Added
+- Power Rankings V2
+- Team need and surplus model
+- Trade target finder
+- Trade partner fit finder
+- Roster-adjusted trade analyser
+- Waiver Engine V2
+- Add/drop suggestions
+- Matchup positional edge table
+- Optional FantasyPros integration for:
+  - consensus rankings
+  - weekly projections
+  - roster-relevant player news
+
+## Optional FantasyPros API key
+
+In Streamlit Community Cloud, open app settings -> Secrets and add:
+
+```toml
+FANTASYPROS_API_KEY = "your_key_here"
+```
+
+Without the key, the app still works using Sleeper data + your league's actual draft market.
 
 ## Files
-- `app.py`
-- `requirements.txt`
-- `.streamlit/config.toml`
-
-Streamlit entry point: `app.py`
+- app.py
+- requirements.txt
+- .streamlit/config.toml
