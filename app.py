@@ -113,42 +113,83 @@ def flatten_rows(payload):
     return []
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fp_rankings(season, key):
-    if not key: return {}
+def fp_rankings(season, key, scoring="PPR"):
+    """Return separate FantasyPros ECR and ADP signals.
+
+    ECR is the expert-value layer; ADP is the market-price layer. They are
+    deliberately kept separate so disagreement can be surfaced rather than
+    averaged away.
+    """
+    if not key:
+        return {}
     out = {}
     for pos in ["QB","RB","WR","TE","K","DST"]:
+        # Expert consensus
         try:
-            payload = fp_get(f"/nfl/{season}/consensus-rankings?position={pos}&scoring=PPR", key)
+            payload = fp_get(
+                f"/nfl/{season}/consensus-rankings?position={pos}&scoring={scoring}",
+                key,
+            )
             for x in flatten_rows(payload):
                 name = x.get("player_name") or x.get("name") or " ".join(
                     y for y in [x.get("player_first_name"), x.get("player_last_name")] if y
                 ).strip()
-                if not name: continue
-                out[name.lower()] = {
-                    "ecr": x.get("rank_ecr") or x.get("rank") or x.get("overall_rank"),
-                    "adp": x.get("rank_adp") or x.get("adp"),
-                    "tier": x.get("tier"),
-                }
+                if not name:
+                    continue
+                rec = out.setdefault(name.lower(), {})
+                rec["ecr"] = x.get("rank_ecr") or x.get("rank") or x.get("overall_rank")
+                rec["tier"] = x.get("tier")
+                # Some responses include ADP alongside ECR.
+                rec["adp"] = x.get("rank_adp") or x.get("adp") or rec.get("adp")
+        except Exception:
+            pass
+
+        # Explicit ADP request gives us a separate market-price signal.
+        try:
+            payload = fp_get(
+                f"/nfl/{season}/consensus-rankings?position={pos}&scoring={scoring}&type=ADP",
+                key,
+            )
+            for x in flatten_rows(payload):
+                name = x.get("player_name") or x.get("name") or " ".join(
+                    y for y in [x.get("player_first_name"), x.get("player_last_name")] if y
+                ).strip()
+                if not name:
+                    continue
+                rec = out.setdefault(name.lower(), {})
+                rec["adp"] = (
+                    x.get("rank_adp") or x.get("adp") or x.get("rank_ecr")
+                    or x.get("rank") or x.get("overall_rank")
+                )
         except Exception:
             pass
     return out
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fp_weekly_projections(season, week, key):
-    if not key: return {}
-    try:
-        payload = fp_get(f"/nfl/{season}/projections?week={week}", key)
-    except Exception:
+def fp_weekly_projections(season, week, key, scoring="PPR"):
+    if not key:
         return {}
-    out = {}
-    for x in flatten_rows(payload):
-        name = x.get("player_name") or x.get("name") or " ".join(
-            y for y in [x.get("player_first_name"), x.get("player_last_name")] if y
-        ).strip()
-        pts = x.get("fantasy_points") or x.get("fpts") or x.get("points") or x.get("projection")
-        if name:
-            try: out[name.lower()] = float(pts)
-            except Exception: pass
+    out={}
+    for pos in ["QB","RB","WR","TE","K","DST"]:
+        try:
+            payload=fp_get(
+                f"/nfl/{season}/projections?week={week}&position={pos}&scoring={scoring}",
+                key,
+            )
+        except Exception:
+            continue
+        for x in flatten_rows(payload):
+            name=x.get("player_name") or x.get("name") or " ".join(
+                y for y in [x.get("player_first_name"),x.get("player_last_name")] if y
+            ).strip()
+            stats=x.get("stats") or {}
+            pts=(
+                x.get("fantasy_points") or x.get("fpts") or x.get("points")
+                or stats.get("points_ppr" if scoring=="PPR" else ("points_half" if scoring=="HALF" else "points"))
+            )
+            if name:
+                try: out[name.lower()]=float(pts)
+                except Exception: pass
     return out
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -215,13 +256,52 @@ def ecr_value(ecr):
     except Exception: return 0.0
     return max(3.0,100/(max(1,e)**0.34))
 
+def adp_value(adp):
+    try: a=float(adp)
+    except Exception: return 0.0
+    return max(2.5,96/(max(1,a)**0.34))
+
+def external_signal(rank_rec):
+    """Blend expert consensus and market price without letting either dominate."""
+    rank_rec = rank_rec or {}
+    ev=ecr_value(rank_rec.get("ecr"))
+    av=adp_value(rank_rec.get("adp"))
+    if ev and av:
+        value=ev*.68+av*.32
+    else:
+        value=ev or av
+    disagreement=0.0
+    if ev and av:
+        disagreement=abs(ev-av)/max(ev,av)
+    return value, disagreement
+
+def asset_quality(combo):
+    """Best-player concentration matters in fantasy trades."""
+    if not combo:
+        return 0.0
+    vals=sorted((float(x["value"]) for x in combo), reverse=True)
+    return vals[0] + (sum(vals[1:])*.58)
+
+def consolidation_premium(combo):
+    """Premium demanded when one side gives the best single asset for depth."""
+    if len(combo) != 1:
+        return 1.0
+    v=float(combo[0]["value"])
+    if v >= 42: return 1.20
+    if v >= 34: return 1.16
+    if v >= 27: return 1.12
+    if v >= 20: return 1.08
+    return 1.04
+
 def player_value(meta, pick_map, rankings):
     name_key=(meta["name"] or "").lower()
-    live=ecr_value(rankings.get(name_key,{}).get("ecr")) if rankings else 0.0
+    ext, disagreement=external_signal(rankings.get(name_key,{})) if rankings else (0.0,0.0)
     drafted=pick_value(pick_map.get(meta["player_id"]))
     sleeper=search_value(meta.get("search_rank"))
-    if live:
-        raw=live*.62+drafted*.28+sleeper*.10
+    if ext:
+        # External expert/market data leads, but the actual Sleeper league draft
+        # and Sleeper's own market/search signal remain meaningful.
+        raw=ext*.60+drafted*.28+sleeper*.12
     elif drafted:
         raw=drafted*.78+sleeper*.22
     else:
@@ -247,6 +327,11 @@ def roster_rows(roster, players, pick_map, rankings):
         m=pmeta(pid,players)
         m["starter"]=str(pid) in starters
         m["value"]=round(player_value(m,pick_map,rankings),2)
+        rr=rankings.get((m["name"] or "").lower(),{}) if rankings else {}
+        m["ecr"]=rr.get("ecr")
+        m["adp"]=rr.get("adp")
+        _,dis=external_signal(rr)
+        m["market_disagreement"]=round(dis*100,1) if dis else 0.0
         out.append(m)
     return out
 
@@ -326,43 +411,125 @@ def combo_label(combo):
     return " + ".join(x["name"] for x in combo)
 
 def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, max_results=10):
-    mine=[x for x in roster_rows(my_roster,players,pick_map,rankings) if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
-    theirs=[x for x in roster_rows(partner,players,pick_map,rankings) if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
-    my_need=needs(my_roster,players,pick_map,rankings); their_need=needs(partner,players,pick_map,rankings)
-    my_sur=surplus(my_roster,players,pick_map,rankings); their_sur=surplus(partner,players,pick_map,rankings)
-    base_me=team_utility(my_roster,players,pick_map,rankings); base_them=team_utility(partner,players,pick_map,rankings)
-    give=[[x] for x in mine]; recv=[[x] for x in theirs]
+    mine=[x for x in roster_rows(my_roster,players,pick_map,rankings)
+          if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
+    theirs=[x for x in roster_rows(partner,players,pick_map,rankings)
+            if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
+
+    my_need=needs(my_roster,players,pick_map,rankings)
+    their_need=needs(partner,players,pick_map,rankings)
+    my_sur=surplus(my_roster,players,pick_map,rankings)
+    their_sur=surplus(partner,players,pick_map,rankings)
+    base_me=team_utility(my_roster,players,pick_map,rankings)
+    base_them=team_utility(partner,players,pick_map,rankings)
+
+    give=[[x] for x in mine]
+    recv=[[x] for x in theirs]
+
+    # Only sensible depth pieces are used to construct 2-for-1 packages.
     mp=sorted(mine,key=lambda x:(my_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:9]
     tp=sorted(theirs,key=lambda x:(their_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:9]
     give += [list(c) for c in itertools.combinations(mp,2)]
     recv += [list(c) for c in itertools.combinations(tp,2)]
+
     results=[]
     for g in give:
         gv=sum(x["value"] for x in g)
         for rc in recv:
-            if len(g)==2 and len(rc)==2: continue
+            if len(g)==2 and len(rc)==2:
+                continue
             rv=sum(x["value"] for x in rc)
-            if not gv or not rv: continue
-            fairness=abs(gv-rv)/max(gv,rv)
-            if fairness>.30: continue
+            if not gv or not rv:
+                continue
+
+            # Raw fairness is not enough for 2-for-1s. The manager giving the
+            # best single asset receives a consolidation/stud premium.
+            adj_gv=gv*consolidation_premium(g)
+            adj_rv=rv*consolidation_premium(rc)
+            fairness_gap=abs(adj_gv-adj_rv)/max(adj_gv,adj_rv)
+            if fairness_gap>.24:
+                continue
+
             mn=roster_after_trade(my_roster,[x["player_id"] for x in g],[x["player_id"] for x in rc])
             tn=roster_after_trade(partner,[x["player_id"] for x in rc],[x["player_id"] for x in g])
-            mg=team_utility(mn,players,pick_map,rankings)-base_me + sum(my_need.get(x["position"],0) for x in rc)*.10
-            tg=team_utility(tn,players,pick_map,rankings)-base_them + sum(their_need.get(x["position"],0) for x in g)*.10
-            if mg < -1 or tg < -3: continue
+            mg=team_utility(mn,players,pick_map,rankings)-base_me
+            tg=team_utility(tn,players,pick_map,rankings)-base_them
+
+            # Small roster-fit bonus, but it cannot rescue a deal that makes
+            # the other manager worse.
+            mg += sum(my_need.get(x["position"],0) for x in rc)*.07
+            tg += sum(their_need.get(x["position"],0) for x in g)*.07
+
+            # Suggested trades should be plausible for BOTH managers.
+            if mg < .35 or tg < .20:
+                continue
+
+            # Asset-quality check: two mediocre pieces cannot simply add up to
+            # an elite one-for-one asset.
+            gq=asset_quality(g)
+            rq=asset_quality(rc)
+            quality_gap=abs(gq-rq)/max(gq,rq)
+            if quality_gap>.27:
+                continue
+
+            fair_pct=max(0,round(100-fairness_gap*100))
+
+            # Acceptance probability is deliberately conservative.
+            balance=max(0.0,1.0-fairness_gap)
+            mutual=max(0.0,min(1.0,(min(mg,tg)+1.5)/5.5))
+            quality=max(0.0,1.0-quality_gap)
+            acceptance=100*(balance*.48 + mutual*.34 + quality*.18)
+
+            # Penalise multi-player offers when the receiving manager is giving
+            # away the clear best player.
+            if len(g)==2 and len(rc)==1:
+                acceptance-=8
+            elif len(g)==1 and len(rc)==2:
+                acceptance-=5
+            acceptance=max(5,min(92,round(acceptance)))
+
+            if acceptance < 43:
+                continue
+
             why=[]
             for pos in {x["position"] for x in rc}:
-                if my_need.get(pos,0)>=4: why.append(f"addresses your {pos} need")
+                if my_need.get(pos,0)>=4:
+                    why.append(f"addresses your {pos} need")
             for pos in {x["position"] for x in g}:
-                if their_need.get(pos,0)>=4: why.append(f"helps their {pos} need")
-            score=mg*2.2+tg*.8+(100-fairness*100)*.15
-            results.append({"You send":combo_label(g),"You receive":combo_label(rc),"Send value":round(gv,1),"Receive value":round(rv,1),"Your improvement":round(mg,1),"Their improvement":round(tg,1),"Fairness":round(100-fairness*100),"Why":"; ".join(why) or "balanced value / roster fit","_score":score})
-    seen=set(); out=[]
+                if their_need.get(pos,0)>=4:
+                    why.append(f"helps their {pos} need")
+            if len(g)!=len(rc):
+                why.append("consolidation premium applied")
+
+            disagreements=[x.get("market_disagreement",0) for x in (g+rc)]
+            max_dis=max(disagreements) if disagreements else 0
+            market_flag="High" if max_dis>=18 else ("Medium" if max_dis>=10 else "Low")
+
+            score=mg*2.0+tg*1.35+acceptance*.16+fair_pct*.08
+            results.append({
+                "You send":combo_label(g),
+                "You receive":combo_label(rc),
+                "Send value":round(gv,1),
+                "Receive value":round(rv,1),
+                "Your improvement":round(mg,1),
+                "Their improvement":round(tg,1),
+                "Fairness":fair_pct,
+                "Acceptance":acceptance,
+                "Market disagreement":market_flag,
+                "Why":"; ".join(why) or "balanced value and mutual roster fit",
+                "_score":score,
+            })
+
+    seen=set()
+    out=[]
     for row in sorted(results,key=lambda x:x["_score"],reverse=True):
         k=(row["You send"],row["You receive"])
-        if k in seen: continue
-        seen.add(k); out.append(row)
-        if len(out)>=max_results: break
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(row)
+        if len(out)>=max_results:
+            break
     return out
 
 def card(label,value,sub=""):
@@ -430,7 +597,9 @@ except Exception as e:
 
 season=int(league.get("season") or 2026)
 key=fp_key()
-rankings=fp_rankings(season,key) if key else {}
+rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
+fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
+rankings=fp_rankings(season,key,fp_scoring) if key else {}
 
 user_map={str(u.get("user_id")):u for u in users}
 roster_names={}
@@ -479,10 +648,11 @@ if st.sidebar.button("Change my team"):
     st.rerun()
 
 if key:
-    st.sidebar.success("Live FantasyPros layer connected")
+    st.sidebar.success(f"FantasyPros connected · {fp_scoring}")
+    st.sidebar.caption("ECR + ADP are used as separate expert and market signals.")
 else:
-    st.sidebar.info("Using Sleeper + draft market model")
-    st.sidebar.caption("Add FantasyPros API key later for live ECR, projections and player news.")
+    st.sidebar.info("Sleeper fallback model active")
+    st.sidebar.caption("Add FANTASYPROS_API_KEY in Streamlit Secrets to enable ECR + ADP market intelligence.")
 
 PAGES=["Home","Power Rankings","My Team","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
 page=st.sidebar.radio("Navigate",PAGES)
@@ -590,11 +760,11 @@ elif page=="My Team":
 # ============================================================
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V2.1")
+    st.markdown("## Trade Centre V3")
     tab0,tab1,tab2,tab3=st.tabs(["Suggested trades","Targets","Partner finder","Analyser"])
 
     with tab0:
-        st.markdown('<div class="notice"><b>Suggested Trades</b> scans every other roster for 1-for-1, 2-for-1 and 1-for-2 deals. It rejects lopsided deals and scores whether both rosters actually improve.</div>',unsafe_allow_html=True)
+        st.markdown('<div class="notice"><b>Suggested Trades V3</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
         filt=st.selectbox("Show suggestions against",["All teams"]+[x for x in team_names if x!=my_name])
         suggestions=[]
         for partner in rosters:
@@ -604,12 +774,17 @@ elif page=="Trade Centre":
                 row["Partner"]=roster_names[partner["roster_id"]]
                 suggestions.append(row)
         if suggestions:
-            sdf=pd.DataFrame(suggestions).sort_values(["Your improvement","Fairness"],ascending=[False,False])
-            cols=["Partner","You send","You receive","Send value","Receive value","Your improvement","Their improvement","Fairness","Why"]
+            sdf=pd.DataFrame(suggestions).sort_values(["_score","Acceptance"],ascending=[False,False])
+            cols=["Partner","You send","You receive","Send value","Receive value","Your improvement","Their improvement","Fairness","Acceptance","Market disagreement","Why"]
             st.dataframe(sdf[cols].head(30),use_container_width=True,hide_index=True)
             st.markdown("### Best 3 to investigate")
             for _,r in sdf.head(3).iterrows():
-                st.markdown(f"**{r['Partner']}** — Send **{r['You send']}** for **{r['You receive']}**  \nYour improvement **{r['Your improvement']:+.1f}** · Their improvement **{r['Their improvement']:+.1f}** · Fairness **{int(r['Fairness'])}%**  \n*{r['Why']}*")
+                st.markdown(
+                    f"**{r['Partner']}** — Send **{r['You send']}** for **{r['You receive']}**  \n"
+                    f"Your impact **{r['Your improvement']:+.1f}** · Their impact **{r['Their improvement']:+.1f}** · "
+                    f"Market fairness **{int(r['Fairness'])}%** · Acceptance **{int(r['Acceptance'])}%**  \n"
+                    f"Market disagreement: **{r['Market disagreement']}** · *{r['Why']}*"
+                )
         else:
             st.info("No deal cleared the fairness and roster-improvement thresholds. The engine will not manufacture a trade just to fill the page.")
 
@@ -725,7 +900,7 @@ elif page=="Matchup Scout":
 elif page=="Lineup":
     st.markdown("## Lineup Optimizer")
     week=st.number_input("Week",1,18,1,1,key="lineupweek")
-    projections=fp_weekly_projections(season,week,key) if key else {}
+    projections=fp_weekly_projections(season,week,key,fp_scoring) if key else {}
     if key:
         st.success("Using live weekly projection feed.")
     else:
