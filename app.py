@@ -494,14 +494,34 @@ def player_components(meta,pick_map,rankings,market_values=None,add_map=None,dro
     else:
         base=draft_val or sleeper_val or 0.0
 
-    external=[]
-    if fp_val: external.append(("FantasyPros",fp_val))
-    if calc_val: external.append(("FantasyCalc",calc_val))
+    # V9.1: external sources are position-relative calibrators, not raw-price anchors.
+    # FantasyCalc's raw scale can be especially inflated at QB in 1QB formats, so map
+    # each external signal toward the Sleeper/draft backbone before blending.
+    def normalise_external(v, backbone, pos):
+        if not v or v <= 0: return 0.0
+        if not backbone or backbone <= 0: return v
+        caps={"QB":.22,"TE":.30,"RB":.38,"WR":.38,"K":.12,"DEF":.12}
+        cap=caps.get(pos,.28)
+        lo,hi=backbone*(1-cap),backbone*(1+cap)
+        return min(hi,max(lo,v))
 
-    # External market is a calibrator, never the identity engine.
+    pos=meta.get("position")
+    fp_norm=normalise_external(fp_val,base,pos)
+    calc_norm=normalise_external(calc_val,base,pos)
+    external=[]
+    if fp_norm: external.append(("FantasyPros",fp_norm))
+    if calc_norm: external.append(("FantasyCalc",calc_norm))
+
+    # Disagreement guardrail: large cross-source gaps lower influence instead of
+    # automatically correcting the engine. This preserves useful ordering signals.
+    disagreement=0.0
+    if base and external:
+        disagreement=max(abs(v-base)/max(base,1.0) for _,v in external)
     if external and base:
         ext_avg=sum(v for _,v in external)/len(external)
-        ext_weight=.34 if len(external)>=2 else .20
+        ext_weight=.28 if len(external)>=2 else .16
+        if disagreement>.30: ext_weight*=.55
+        elif disagreement>.20: ext_weight*=.75
         consensus=base*(1-ext_weight)+ext_avg*ext_weight
     elif external:
         consensus=sum(v for _,v in external)/len(external)
@@ -519,6 +539,9 @@ def player_components(meta,pick_map,rankings,market_values=None,add_map=None,dro
         "draft":draft_val,
         "fantasypros":fp_val,
         "fantasycalc":calc_val,
+        "fantasypros_normalised":fp_norm,
+        "fantasycalc_normalised":calc_norm,
+        "source_disagreement":disagreement,
         "trend":trend,
         "external_count":len(external),
         "market_confidence":market_confidence_label([base>0,fp_val>0,calc_val>0,abs(trend)>.15]),
@@ -1270,7 +1293,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V9 · Multi-source Engine")
+st.sidebar.success("V9.1 · Normalised Market Engine")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} FantasyPros-ranked · {engine_fallback} Sleeper-first fallback")
 st.sidebar.caption(
     ("FantasyCalc market connected · " + str(MARKET_DIAG.get("rows",0)) + " records")
