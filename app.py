@@ -688,6 +688,33 @@ def trade_rationale(my_roster, partner, give_combo, receive_combo, players, pick
     return you_txt, them_txt, my_bonus, their_bonus
 
 
+
+def offer_quality(row):
+    """Human-facing label: separates a good target from a genuinely sendable offer."""
+    acc=float(row.get("Acceptance",0))
+    their=float(row.get("Their impact",0))
+    fair=float(row.get("Fairness",0))
+    if acc>=68 and their>=-0.45 and fair>=72:
+        return "Send it"
+    if acc>=54 and their>=-0.85 and fair>=64:
+        return "Good opening offer"
+    if acc>=38:
+        return "Likely counter"
+    return "Long shot"
+
+def target_gap_label(row):
+    """Explain when the target is good but the proposed price is probably light."""
+    q=row.get("Offer quality","")
+    if q not in {"Likely counter","Long shot"}:
+        return ""
+    their=float(row.get("Their impact",0))
+    fair=float(row.get("Fairness",0))
+    if their < -1.25 or fair < 58:
+        return "Offer is light — expect to add meaningful value"
+    if their < -.65 or fair < 66:
+        return "Probably needs a small sweetener"
+    return "Target is viable, but expect negotiation"
+
 def opportunity_bucket(row):
     """Display bucket: broad enough to be useful, strict enough to avoid junk."""
     acc=row.get("Acceptance",0)
@@ -771,11 +798,14 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             te_gain = te_replacement_gain(my_roster,rc,g,players,pick_map,rankings)
             their_te_gain = te_replacement_gain(partner,g,rc,players,pick_map,rankings)
 
+            # V8.4: elite TE acquisition remains valuable, but incremental TE scarcity
+            # cannot manufacture several points of roster impact by itself.
+            te_component=min(0.85,te_gain*.045)
             useful_gain = (
                 my_gain
                 + objective_gain*.28
                 + max(0,starter_gain)*.28
-                + min(2.0,te_gain*.08)
+                + te_component
                 - opp_cost
             )
             useful_their_gain = (
@@ -903,6 +933,8 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 "_score":useful_gain*3.0+max(0,starter_gain)*1.6+useful_their_gain*.9+acceptance*.12+fairness*.04,
             }
             row_out["Bucket"]=opportunity_bucket(row_out)
+            row_out["Offer quality"]=offer_quality(row_out)
+            row_out["Target note"]=target_gap_label(row_out)
             if row_out["Bucket"]!="Hide":
                 results.append(row_out)
 
@@ -1062,7 +1094,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V8.3 · V7.1 Engine LOCKED")
+st.sidebar.success("V8.4 · V7.1 Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
 with st.sidebar.expander("Player engine diagnostics"):
     st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
@@ -1203,34 +1235,55 @@ elif page=="Player Engine":
     st.info("V8 keeps the V7.1 Sleeper-first player engine locked. FantasyPros only calibrates players it can confidently match; unmatched players retain full Sleeper-first values.")
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V8.3.1")
-    st.caption("Broader opportunity board: realistic upgrades, upside swings, consolidation packages and buy-low targets — while V8.3's TE and opportunity-cost controls stay locked.")
+    st.markdown("## Trade Centre V8.4.1")
+    st.caption("Refined trade board: better targets, clearer offer realism, fewer duplicate packages and tighter elite-TE impact — with the V7.1 player engine locked.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
     top_obj=my_objectives[0] if my_objectives else None
     if top_obj:
         st.markdown(
             f'<div class="notice"><b>Current trade objective:</b> Improve <b>{top_obj["position"]}</b> '
-            f'({top_obj["score"]:.1f} priority score). V8.3 keeps the TE/opportunity-cost fixes, but relaxes display thresholds so you can see more genuinely interesting options instead of only perfect-model trades.</div>',
+            f'({top_obj["score"]:.1f} priority score). V8.4 keeps the broader opportunity pool, distinguishes a great target from a sendable offer, and trims remaining elite-TE impact inflation.</div>',
             unsafe_allow_html=True
         )
 
     tab0,tab1,tab2,tab3,tab4=st.tabs(["Best upgrades","Target builder","Partner finder","Analyser","League market"])
 
     with tab0:
-        filt=st.selectbox("Show offers against",["All teams"]+[x for x in team_names if x!=my_name],key="v83_all_filter")
+        filt=st.selectbox("Show offers against",["All teams"]+[x for x in team_names if x!=my_name],key="v84_all_filter")
         suggestions=[]
         for partner in rosters:
             if partner["roster_id"]==my_rid:
                 continue
             if filt!="All teams" and roster_names[partner["roster_id"]]!=filt:
                 continue
-            for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,32):
+            for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,40):
                 row["Partner"]=roster_names[partner["roster_id"]]
                 suggestions.append(row)
 
         if suggestions:
             sdf=pd.DataFrame(suggestions)
+
+            # De-duplicate near-identical ideas: same partner + main target + bucket.
+            # Keep the strongest combination rather than showing 3 versions differing
+            # only by one interchangeable bench piece.
+            sdf["_target"]=sdf["You receive"].astype(str).str.split(" + ").str[0]
+            sdf=sdf.sort_values(["_score","Acceptance"],ascending=[False,False])
+            sdf=sdf.drop_duplicates(subset=["Partner","_target","Bucket"],keep="first")
+
+            # Small command-centre shortlist.
+            top=sdf.sort_values(["Your impact","Acceptance","_score"],ascending=[False,False,False]).head(3)
+            if len(top):
+                st.markdown("### Top opportunities")
+                cards=st.columns(min(3,len(top)))
+                for i,(_,r) in enumerate(top.iterrows()):
+                    with cards[i]:
+                        st.metric(str(r["You receive"]), f'{r["Your impact"]:+.1f} impact')
+                        st.caption(f'{r["Partner"]} · {r["Offer quality"]}')
+                        st.caption(f'Send: {r["You send"]}')
+                        if r.get("Target note"):
+                            st.caption(r["Target note"])
+
             bucket_order=[
                 "Best realistic upgrades",
                 "High-upside offers",
@@ -1238,22 +1291,27 @@ elif page=="Trade Centre":
                 "Buy-low targets",
             ]
             for bucket in bucket_order:
-                subset=sdf[sdf["Bucket"]==bucket].sort_values(["Your impact","Acceptance","_score"],ascending=[False,False,False])
+                subset=sdf[sdf["Bucket"]==bucket].sort_values(
+                    ["Your impact","Acceptance","_score"],ascending=[False,False,False]
+                )
                 if len(subset):
                     st.markdown(f"### {bucket}")
                     if bucket=="Best realistic upgrades":
                         st.caption("Meaningfully helps you and has a credible path to acceptance.")
                     elif bucket=="High-upside offers":
-                        st.caption("Strong for your roster, but expect a tougher negotiation or counter.")
+                        st.caption("Strong target for your roster; offer quality tells you whether this exact package is realistic.")
                     elif bucket=="Package / consolidation targets":
                         st.caption("Use depth to chase a better single starter without treating two-for-one arithmetic as equal value.")
                     else:
                         st.caption("Lower-cost swings where the upside is more interesting than the immediate projection.")
 
-                    cols=["Partner","You send","You receive","Your impact","Starter upgrade","Their impact","Fairness","Acceptance","Why"]
-                    st.dataframe(subset[cols].head(8),use_container_width=True,hide_index=True)
+                    cols=[
+                        "Partner","You send","You receive","Your impact","Starter upgrade",
+                        "Their impact","Fairness","Acceptance","Offer quality","Target note"
+                    ]
+                    st.dataframe(subset[cols].head(6),use_container_width=True,hide_index=True)
         else:
-            st.info("No worthwhile opportunities currently clear V8.3's floor. The app will not invent bench churn just to fill the page.")
+            st.info("No worthwhile opportunities currently clear V8.4's floor. The app will not invent bench churn just to fill the page.")
 
     with tab1:
         st.markdown("### Target builder")
