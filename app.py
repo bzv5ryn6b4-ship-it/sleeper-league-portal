@@ -14,6 +14,7 @@ import streamlit as st
 DEFAULT_LEAGUE_ID = "1389344022107021312"
 SLEEPER = "https://api.sleeper.app/v1"
 FP = "https://api.fantasypros.com/public/v2/json"
+FANTASYCALC = "https://api.fantasycalc.com/values/current"
 
 st.set_page_config(
     page_title="Sleeper GM",
@@ -241,6 +242,111 @@ def fp_news(key):
     except Exception:
         return []
 
+@st.cache_data(ttl=10800, show_spinner=False)
+def fantasycalc_values(num_teams=12, ppr=1.0, num_qbs=1):
+    """Optional public redraft market layer. Fails closed if the endpoint changes/unavailable."""
+    params={
+        "isDynasty":"false",
+        "numQbs":int(num_qbs),
+        "numTeams":int(num_teams),
+        "ppr":float(ppr),
+    }
+    try:
+        r=requests.get(FANTASYCALC,params=params,headers={"User-Agent":"SleeperGM/9.0"},timeout=15)
+        r.raise_for_status()
+        payload=r.json()
+    except Exception as e:
+        return {}, {"ok":False,"message":str(e),"rows":0}
+
+    rows=payload if isinstance(payload,list) else payload.get("values") or payload.get("players") or payload.get("data") or []
+    out={}
+    for item in rows:
+        if not isinstance(item,dict):
+            continue
+        player=item.get("player") if isinstance(item.get("player"),dict) else {}
+        name=(
+            item.get("name") or item.get("playerName") or item.get("player_name")
+            or player.get("name") or player.get("playerName")
+        )
+        if not name:
+            first=item.get("firstName") or player.get("firstName")
+            last=item.get("lastName") or player.get("lastName")
+            name=" ".join(x for x in [first,last] if x)
+        if not name:
+            continue
+
+        raw_value=(
+            item.get("value") or item.get("redraftValue") or item.get("tradeValue")
+            or player.get("value") or player.get("redraftValue")
+        )
+        try:
+            raw_value=float(raw_value)
+        except Exception:
+            raw_value=None
+
+        rank=item.get("overallRank") or item.get("rank") or item.get("redraftRank") or player.get("rank")
+        try:
+            rank=float(rank)
+        except Exception:
+            rank=None
+
+        pos=item.get("position") or player.get("position")
+        team=item.get("team") or player.get("team")
+        out[normalize_player_name(name)]={
+            "market_raw":raw_value,
+            "market_rank":rank,
+            "market_position":pos,
+            "market_team":team,
+        }
+    return out, {"ok":bool(out),"message":f"{len(out)} FantasyCalc redraft records" if out else "No FantasyCalc records parsed","rows":len(out)}
+
+@st.cache_data(ttl=900, show_spinner=False)
+def sleeper_trend_maps():
+    """Live add/drop movement used only as a small market-momentum signal."""
+    try:
+        adds=sleeper_get("/players/nfl/trending/add?lookback_hours=24&limit=200")
+    except Exception:
+        adds=[]
+    try:
+        drops=sleeper_get("/players/nfl/trending/drop?lookback_hours=24&limit=200")
+    except Exception:
+        drops=[]
+    amap={str(x.get("player_id")):float(x.get("count") or 0) for x in adds if x.get("player_id") is not None}
+    dmap={str(x.get("player_id")):float(x.get("count") or 0) for x in drops if x.get("player_id") is not None}
+    return amap,dmap
+
+def fantasycalc_signal(meta, market_values):
+    rec=(market_values or {}).get(normalize_player_name(meta.get("name")))
+    if not rec:
+        return 0.0, None
+    raw=rec.get("market_raw")
+    rank=rec.get("market_rank")
+    # Prefer explicit market value if present, but compress unknown scales.
+    if raw is not None and raw>0:
+        # FantasyCalc values can be on a much larger raw scale. Convert monotonically
+        # into the app's ~0-100 value space without assuming an exact published scale.
+        val=12.0*math.log1p(raw)
+        val=min(95.0,max(3.0,val))
+    elif rank:
+        val=max(3.0,105/(max(1.0,float(rank))**0.34))
+    else:
+        return 0.0, rec
+    return val, rec
+
+def trend_adjustment(meta, add_map, drop_map):
+    adds=float((add_map or {}).get(str(meta.get("player_id")),0))
+    drops=float((drop_map or {}).get(str(meta.get("player_id")),0))
+    # Momentum is intentionally capped. It should flag changing roles, not redefine talent.
+    return max(-2.0,min(2.0,math.log1p(adds)*.32-math.log1p(drops)*.28))
+
+def market_confidence_label(signals):
+    n=sum(1 for x in signals if x)
+    if n>=4:return "Very High"
+    if n==3:return "High"
+    if n==2:return "Medium"
+    return "Low"
+
+
 # ============================================================
 # DATA / VALUE MODEL
 # ============================================================
@@ -374,32 +480,98 @@ def position_curve(pos, raw):
     elif pos=="QB" and x>32: x=32+(x-32)*1.04
     return x
 
-def player_value(meta,pick_map,rankings):
+def player_components(meta,pick_map,rankings,market_values=None,add_map=None,drop_map=None):
     rr=ranking_lookup(rankings,meta["name"]) if rankings else {}
-    ext,_=external_signal(rr) if rr else (0.0,0.0)
-    drafted=pick_value(pick_map.get(meta["player_id"]))
-    sleeper=sleeper_market_value(meta)
-    base=drafted*.54+sleeper*.46 if drafted and sleeper else drafted or sleeper
-    # External consensus is a corroborating signal, never the identity/value engine.
-    ext_weight=.28 if rr.get("ecr") is not None and rr.get("adp") is not None else .18 if ext else 0
-    raw=base*(1-ext_weight)+ext*ext_weight if ext and base else ext or base
-    return max(0.0,position_curve(meta.get("position"),raw)*injury_mult(meta.get("injury")))
+    fp_val,_=external_signal(rr) if rr else (0.0,0.0)
+    draft_val=pick_value(pick_map.get(meta["player_id"]))
+    sleeper_val=sleeper_market_value(meta)
+    calc_val,_=fantasycalc_signal(meta,market_values or {})
+    trend=trend_adjustment(meta,add_map or {},drop_map or {})
+
+    # Sleeper + actual league draft remain the universal backbone.
+    if draft_val and sleeper_val:
+        base=draft_val*.50+sleeper_val*.50
+    else:
+        base=draft_val or sleeper_val or 0.0
+
+    external=[]
+    if fp_val: external.append(("FantasyPros",fp_val))
+    if calc_val: external.append(("FantasyCalc",calc_val))
+
+    # External market is a calibrator, never the identity engine.
+    if external and base:
+        ext_avg=sum(v for _,v in external)/len(external)
+        ext_weight=.34 if len(external)>=2 else .20
+        consensus=base*(1-ext_weight)+ext_avg*ext_weight
+    elif external:
+        consensus=sum(v for _,v in external)/len(external)
+    else:
+        consensus=base
+
+    # Small live-market nudge.
+    consensus=max(0.0,consensus+trend)
+    final=max(0.0,position_curve(meta.get("position"),consensus)*injury_mult(meta.get("injury")))
+
+    return {
+        "final":final,
+        "base":base,
+        "sleeper":sleeper_val,
+        "draft":draft_val,
+        "fantasypros":fp_val,
+        "fantasycalc":calc_val,
+        "trend":trend,
+        "external_count":len(external),
+        "market_confidence":market_confidence_label([base>0,fp_val>0,calc_val>0,abs(trend)>.15]),
+    }
+
+def player_value(meta,pick_map,rankings):
+    c=player_components(
+        meta,pick_map,rankings,
+        globals().get("MARKET_VALUES",{}),
+        globals().get("TREND_ADDS",{}),
+        globals().get("TREND_DROPS",{}),
+    )
+    return c["final"]
+
 
 def roster_rows(roster,players,pick_map,rankings):
     starters={str(x) for x in (roster.get("starters") or [])}
     out=[]
     for pid in roster.get("players") or []:
-        m=pmeta(pid,players); m["starter"]=str(pid) in starters
-        m["value"]=round(player_value(m,pick_map,rankings)*(1.035 if m["starter"] and m.get("position") in {"RB","WR","TE"} else 1.015 if m["starter"] and m.get("position")=="QB" else 1.0),2)
+        m=pmeta(pid,players)
+        m["starter"]=str(pid) in starters
+        comps=player_components(
+            m,pick_map,rankings,
+            globals().get("MARKET_VALUES",{}),
+            globals().get("TREND_ADDS",{}),
+            globals().get("TREND_DROPS",{}),
+        )
+        starter_mult=1.035 if m["starter"] and m.get("position") in {"RB","WR","TE"} else 1.015 if m["starter"] and m.get("position")=="QB" else 1.0
+        m["value"]=round(comps["final"]*starter_mult,2)
+
         rr=ranking_lookup(rankings,m["name"]) if rankings else {}
-        m["ecr"]=rr.get("ecr"); m["adp"]=rr.get("adp")
+        m["ecr"]=rr.get("ecr")
+        m["adp"]=rr.get("adp")
         _,dis=external_signal(rr) if rr else (0.0,0.0)
         m["market_disagreement"]=round(dis*100,1) if dis else 0.0
+
+        m["sleeper_value"]=round(comps["sleeper"],1) if comps["sleeper"] else None
+        m["draft_value"]=round(comps["draft"],1) if comps["draft"] else None
+        m["fp_value"]=round(comps["fantasypros"],1) if comps["fantasypros"] else None
+        m["fantasycalc_value"]=round(comps["fantasycalc"],1) if comps["fantasycalc"] else None
+        m["trend_adjustment"]=round(comps["trend"],2)
+        m["market_confidence"]=comps["market_confidence"]
+
         sig=value_source(m,pick_map,rankings)
+        if comps["fantasycalc"]:
+            sig.append("FantasyCalc")
+        if abs(comps["trend"])>.15:
+            sig.append("Sleeper trend")
         m["value_source"]=" + ".join(sig) if sig else "Sleeper fallback"
         m["confidence"]=value_confidence(m,pick_map,rankings)
         out.append(m)
     return out
+
 
 def pos_values(roster, players, pick_map, rankings):
     d=defaultdict(list)
@@ -1035,6 +1207,10 @@ fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
 rankings=fp_rankings(season,key,fp_scoring) if key else {}
 fp_diag=fp_diagnostics(season,key,fp_scoring)
 fp_active=bool(fp_diag.get("ok") and rankings)
+num_qbs=2 if "SUPER_FLEX" in slots else max(1,slot_counts.get("QB",1))
+MARKET_VALUES,MARKET_DIAG=fantasycalc_values(len(rosters),rec_pts,num_qbs)
+TREND_ADDS,TREND_DROPS=sleeper_trend_maps()
+
 
 user_map={str(u.get("user_id")):u for u in users}
 roster_names={}
@@ -1094,15 +1270,20 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V8.4 · V7.1 Engine LOCKED")
-st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
+st.sidebar.success("V9 · Multi-source Engine")
+st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} FantasyPros-ranked · {engine_fallback} Sleeper-first fallback")
+st.sidebar.caption(
+    ("FantasyCalc market connected · " + str(MARKET_DIAG.get("rows",0)) + " records")
+    if MARKET_DIAG.get("ok") else
+    "FantasyCalc unavailable · engine continues safely without it"
+)
 with st.sidebar.expander("Player engine diagnostics"):
     st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
     st.caption("FantasyPros is optional. Missing external rankings no longer means a player is missing from the engine.")
     if st.button("Clear API caches and retry",key="v7cache"):
         st.cache_data.clear(); st.rerun()
 
-PAGES=["Home","Power Rankings","My Team","Player Engine","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
+PAGES=["Home","Power Rankings","My Team","Player Engine","Market Calibration","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
 page=st.sidebar.radio("Navigate",PAGES)
 st.sidebar.markdown("---")
 st.sidebar.caption(f"{league.get('name','League')} · {league.get('season','')}")
@@ -1118,7 +1299,7 @@ rank={x["rid"]:i+1 for i,x in enumerate(power)}
 pscore={x["rid"]:x["score"] for x in power}
 
 st.markdown(
-    f'<div class="hero"><div class="kicker">Sleeper GM V7</div>'
+    f'<div class="hero"><div class="kicker">Sleeper GM V9</div>'
     f'<h1>{my_name}</h1><p>{league.get("name","Sleeper League")} · live roster intelligence</p></div>',
     unsafe_allow_html=True
 )
@@ -1234,8 +1415,62 @@ elif page=="Player Engine":
         st.dataframe(edf[edf["Confidence"].isin(["Low","Medium"])].sort_values("Value",ascending=False).head(50),use_container_width=True,hide_index=True)
     st.info("V8 keeps the V7.1 Sleeper-first player engine locked. FantasyPros only calibrates players it can confidently match; unmatched players retain full Sleeper-first values.")
 
+elif page=="Market Calibration":
+    st.markdown("## Market Calibration · V9")
+    st.caption("Compare the locked Sleeper-first engine with independent market signals before those values feed Trade Centre.")
+
+    all_rows=[]
+    for r in rosters:
+        for x in roster_rows(r,players,pick_map,rankings):
+            if x["position"] not in {"QB","RB","WR","TE"}:
+                continue
+            external_vals=[v for v in [x.get("fp_value"),x.get("fantasycalc_value")] if isinstance(v,(int,float))]
+            external_avg=sum(external_vals)/len(external_vals) if external_vals else None
+            gap=(x["value"]-external_avg) if external_avg is not None else None
+            gap_pct=(gap/external_avg*100) if external_avg else None
+            all_rows.append({
+                "Player":x["name"],"Pos":x["position"],"NFL":x["team"],"Owner":roster_names[r["roster_id"]],
+                "Consensus":x["value"],"Sleeper":x.get("sleeper_value"),"League draft":x.get("draft_value"),
+                "FantasyPros":x.get("fp_value"),"FantasyCalc":x.get("fantasycalc_value"),
+                "Trend":x.get("trend_adjustment"),"Market confidence":x.get("market_confidence"),
+                "Engine vs external %":round(gap_pct,1) if gap_pct is not None else None,
+            })
+
+    mdf=pd.DataFrame(all_rows)
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Rostered players",len(mdf))
+    c2.metric("FantasyPros values",int(mdf["FantasyPros"].notna().sum()))
+    c3.metric("FantasyCalc values",int(mdf["FantasyCalc"].notna().sum()))
+    c4.metric("Market feed", "LIVE" if MARKET_DIAG.get("ok") else "Fallback")
+
+    tab_a,tab_b,tab_c=st.tabs(["Consensus board","Biggest disagreements","My roster"])
+
+    with tab_a:
+        st.dataframe(
+            mdf.sort_values(["Consensus","Player"],ascending=[False,True]).head(120),
+            use_container_width=True,hide_index=True
+        )
+
+    with tab_b:
+        ddf=mdf[mdf["Engine vs external %"].notna()].copy()
+        ddf["Abs disagreement"]=ddf["Engine vs external %"].abs()
+        st.dataframe(
+            ddf.sort_values("Abs disagreement",ascending=False)[
+                ["Player","Pos","Owner","Consensus","FantasyPros","FantasyCalc","Engine vs external %","Market confidence"]
+            ].head(60),
+            use_container_width=True,hide_index=True
+        )
+        st.caption("Large disagreement is a review flag, not an automatic correction. The engine deliberately avoids letting one outside source overwrite the league model.")
+
+    with tab_c:
+        mydf=mdf[mdf["Owner"]==my_name].copy()
+        st.dataframe(
+            mydf.sort_values("Consensus",ascending=False),
+            use_container_width=True,hide_index=True
+        )
+
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V8.4.1")
+    st.markdown("## Trade Centre V9.1")
     st.caption("Refined trade board: better targets, clearer offer realism, fewer duplicate packages and tighter elite-TE impact — with the V7.1 player engine locked.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
