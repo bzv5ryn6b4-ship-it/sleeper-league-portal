@@ -555,6 +555,93 @@ def acceptance_label(p):
     if p>=55:return "Medium"
     return "Low"
 
+
+def impact_band(v):
+    if v >= 3.0: return "League changer"
+    if v >= 1.5: return "Clear upgrade"
+    if v >= 0.5: return "Marginal upgrade"
+    return "Negligible"
+
+def roster_objectives(roster, players, pick_map, rankings):
+    """Rank the roster's actual upgrade priorities."""
+    nd=needs(roster,players,pick_map,rankings)
+    vals=pos_values(roster,players,pick_map,rankings)
+
+    objectives=[]
+    for pos in ["QB","RB","WR","TE"]:
+        need_score=float(nd.get(pos,0))
+        starters={"QB":1,"RB":2,"WR":2,"TE":1}.get(pos,1)
+        arr=vals.get(pos,[])
+        starter_quality=sum(arr[:starters])/starters if arr else 0
+        depth_quality=sum(arr[starters:starters+2])/max(1,len(arr[starters:starters+2])) if len(arr)>starters else 0
+        scarcity_bonus={"RB":2.2,"WR":1.7,"TE":1.5,"QB":.6}.get(pos,1.0)
+
+        score = need_score*1.6 + scarcity_bonus
+        if starter_quality < {"QB":22,"RB":28,"WR":25,"TE":18}[pos]:
+            score += 3.2
+        if depth_quality < {"QB":10,"RB":14,"WR":13,"TE":8}[pos]:
+            score += 1.0
+
+        objectives.append({
+            "position":pos,
+            "score":round(score,2),
+            "need":round(need_score,2),
+            "starter_quality":round(starter_quality,2),
+            "depth_quality":round(depth_quality,2),
+        })
+
+    return sorted(objectives,key=lambda x:x["score"],reverse=True)
+
+def objective_bonus(receive_combo, objectives):
+    bypos={x["position"]:x for x in objectives}
+    score=0.0
+    reasons=[]
+    for x in receive_combo:
+        o=bypos.get(x["position"])
+        if not o: 
+            continue
+        if o["score"] >= 5:
+            score += min(4.5,o["score"]*.35)
+            reasons.append(f"targets your {x['position']} weakness")
+    return score, reasons
+
+def projected_starting_upgrade(roster, receive_combo, give_combo, players, pick_map, rankings):
+    """Approximate whether the deal improves a weekly starting slot, not just total depth."""
+    before=roster_rows(roster,players,pick_map,rankings)
+    before_by=defaultdict(list)
+    for x in before:
+        if x["position"] in {"QB","RB","WR","TE"}:
+            before_by[x["position"]].append(x["value"])
+    for pos in before_by:
+        before_by[pos].sort(reverse=True)
+
+    after=roster_after_trade(roster,[x["player_id"] for x in give_combo],[x["player_id"] for x in receive_combo])
+    after_rows=roster_rows(after,players,pick_map,rankings)
+    after_by=defaultdict(list)
+    for x in after_rows:
+        if x["position"] in {"QB","RB","WR","TE"}:
+            after_by[x["position"]].append(x["value"])
+    for pos in after_by:
+        after_by[pos].sort(reverse=True)
+
+    starter_counts={"QB":1,"RB":2,"WR":2,"TE":1}
+    before_total=after_total=0.0
+    for pos,n in starter_counts.items():
+        before_total += sum(before_by.get(pos,[])[:n])
+        after_total += sum(after_by.get(pos,[])[:n])
+
+    return after_total-before_total
+
+def trade_rationale(my_roster, partner, give_combo, receive_combo, players, pick_map, rankings):
+    my_obj=roster_objectives(my_roster,players,pick_map,rankings)
+    their_obj=roster_objectives(partner,players,pick_map,rankings)
+    my_bonus,my_reasons=objective_bonus(receive_combo,my_obj)
+    their_bonus,their_reasons=objective_bonus(give_combo,their_obj)
+
+    you_txt=", ".join(my_reasons) if my_reasons else "improves your starter quality / consolidates value"
+    them_txt=", ".join(their_reasons) if their_reasons else "adds useful value without clearly worsening a priority position"
+    return you_txt, them_txt, my_bonus, their_bonus
+
 def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, max_results=20):
     mine=[x for x in roster_rows(my_roster,players,pick_map,rankings)
           if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
@@ -563,13 +650,13 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
 
     base_me=team_utility(my_roster,players,pick_map,rankings)
     base_them=team_utility(partner,players,pick_map,rankings)
-
     my_sur=surplus(my_roster,players,pick_map,rankings)
     their_sur=surplus(partner,players,pick_map,rankings)
+    my_obj=roster_objectives(my_roster,players,pick_map,rankings)
 
-    # Singles plus controlled two-player packages.
     give=[[x] for x in mine]
     recv=[[x] for x in theirs]
+
     mp=sorted(mine,key=lambda x:(my_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:10]
     tp=sorted(theirs,key=lambda x:(their_sur.get(x["position"],0),not x["starter"],x["value"]),reverse=True)[:10]
     give += [list(c) for c in itertools.combinations(mp,2)]
@@ -586,11 +673,10 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             if gv<=0 or rv<=0:
                 continue
 
-            # Human market values, not arithmetic sum.
             hgv=human_trade_value(g)
             hrv=human_trade_value(rc)
             market_gap=abs(hgv-hrv)/max(hgv,hrv)
-            if market_gap>.28:
+            if market_gap>.30:
                 continue
 
             mn=roster_after_trade(my_roster,[x["player_id"] for x in g],[x["player_id"] for x in rc])
@@ -599,63 +685,77 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             my_gain=team_utility(mn,players,pick_map,rankings)-base_me
             their_gain=team_utility(tn,players,pick_map,rankings)-base_them
 
-            # A generated recommendation must benefit us. Opponent can be slightly negative
-            # only for an aggressive opening offer, never for a "realistic" suggestion.
-            if my_gain < .35 or their_gain < -.6:
+            starter_gain=projected_starting_upgrade(my_roster,rc,g,players,pick_map,rankings)
+            their_starter_gain=projected_starting_upgrade(partner,g,rc,players,pick_map,rankings)
+
+            you_reason, them_reason, objective_gain, their_objective_gain = trade_rationale(
+                my_roster,partner,g,rc,players,pick_map,rankings
+            )
+
+            # Objective-adjusted impact: starter upgrade and roster need are what make a trade worth doing.
+            useful_gain = my_gain + objective_gain*.38 + max(0,starter_gain)*.22
+            useful_their_gain = their_gain + their_objective_gain*.28 + max(0,their_starter_gain)*.14
+
+            # V8.1 key rule: don't clutter recommendations with pointless bench swaps.
+            receives_starter_upgrade = starter_gain >= .75
+            receives_priority_asset = any(
+                o["position"] in {x["position"] for x in rc} and o["score"]>=5
+                for o in my_obj
+            )
+            consolidation = len(g)>len(rc) and max(x["value"] for x in rc) > max(x["value"] for x in g)*1.08
+
+            meaningful = (
+                useful_gain >= 1.15
+                or starter_gain >= 1.25
+                or (receives_priority_asset and useful_gain >= .75)
+                or consolidation
+            )
+            if not meaningful:
+                continue
+
+            # Never recommend a trade that is basically a bench lateral.
+            if all(not x.get("starter") for x in g+rc) and starter_gain < .75 and useful_gain < 1.5:
+                continue
+
+            if useful_gain < .55 or useful_their_gain < -.75:
                 continue
 
             my_inc=manager_incentive(g,rc,my_roster,players,pick_map,rankings)
             their_inc=manager_incentive(rc,g,partner,players,pick_map,rankings)
 
-            # Best-player-in-deal ownership matters heavily.
-            best_g=max(g,key=lambda x:x["value"])
-            best_r=max(rc,key=lambda x:x["value"])
             best_overall=max(g+rc,key=lambda x:x["value"])
             consolidation_penalty=0
             if len(g)==2 and len(rc)==1:
-                consolidation_penalty=10
-                if best_overall in rc:
-                    consolidation_penalty+=8
+                consolidation_penalty=10 + (8 if best_overall in rc else 0)
             elif len(g)==1 and len(rc)==2:
-                consolidation_penalty=6
-                if best_overall in g:
-                    consolidation_penalty+=6
+                consolidation_penalty=6 + (6 if best_overall in g else 0)
 
             starter_penalty=0
-            # If opponent gives a starter and receives no likely starter, acceptance drops.
             if any(x.get("starter") for x in rc) and not any(x.get("starter") for x in g):
                 starter_penalty+=12
 
             exp_out=sum(expendability(x,partner,players,pick_map,rankings) for x in rc)/len(rc)
-            exp_in=sum(expendability(x,my_roster,players,pick_map,rankings) for x in g)/len(g)
-
             fairness=max(0,100-market_gap*100)
-            mutual=max(-8,min(12,their_gain*4.2))
+
+            mutual=max(-8,min(12,useful_their_gain*4.0))
             incentive=max(-10,min(12,their_inc*2.4))
-            acceptance=(
-                26
-                + fairness*.34
-                + mutual
-                + incentive
-                + (exp_out-50)*.12
-                - consolidation_penalty
-                - starter_penalty
-            )
+            acceptance=26 + fairness*.34 + mutual + incentive + (exp_out-50)*.12 - consolidation_penalty - starter_penalty
             acceptance=max(3,min(91,round(acceptance)))
 
-            # Market disagreement lowers confidence in acceptance estimate.
             disagreements=[x.get("market_disagreement",0) for x in g+rc]
             max_dis=max(disagreements) if disagreements else 0
             if max_dis>=18:
-                acceptance=max(3,acceptance-6)
-                market_flag="High"
+                acceptance=max(3,acceptance-6); market_flag="High"
             elif max_dis>=10:
-                acceptance=max(3,acceptance-3)
-                market_flag="Medium"
+                acceptance=max(3,acceptance-3); market_flag="Medium"
             else:
                 market_flag="Low"
 
-            tier=offer_tier(acceptance,my_gain,their_gain)
+            band=impact_band(useful_gain)
+            if band=="Negligible":
+                continue
+
+            tier=offer_tier(acceptance,useful_gain,useful_their_gain)
             if tier=="Strong" and acceptance<65:
                 continue
             if tier=="Realistic" and acceptance<52:
@@ -664,38 +764,37 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 continue
 
             why=[]
-            nd=needs(partner,players,pick_map,rankings)
-            for pos in {x["position"] for x in g}:
-                if nd.get(pos,0)>=3:
-                    why.append(f"fills their {pos} need")
-            if exp_out>=60:
-                why.append("their outgoing asset is relatively expendable")
+            if you_reason:
+                why.append("YOU: "+you_reason)
+            if them_reason:
+                why.append("THEM: "+them_reason)
             if len(g)>len(rc):
-                why.append("you pay a consolidation premium")
-            if not why:
-                why.append("close market value with workable roster fit")
+                why.append("you pay consolidation premium")
+            if starter_gain>=1.25:
+                why.append("clear weekly starter upgrade")
 
             results.append({
                 "Tier":tier,
+                "Impact":band,
                 "You send":combo_label(g),
                 "You receive":combo_label(rc),
                 "Send value":round(gv,1),
                 "Receive value":round(rv,1),
-                "Human send":round(hgv,1),
-                "Human receive":round(hrv,1),
-                "Your impact":round(my_gain,1),
-                "Their impact":round(their_gain,1),
+                "Your impact":round(useful_gain,1),
+                "Their impact":round(useful_their_gain,1),
+                "Starter upgrade":round(starter_gain,1),
                 "Fairness":round(fairness),
                 "Acceptance":acceptance,
                 "Acceptance level":acceptance_label(acceptance),
                 "Market disagreement":market_flag,
-                "Why":"; ".join(why),
-                "_score":my_gain*2.2+their_gain*1.1+acceptance*.16+fairness*.05,
+                "Why":" · ".join(why),
+                "_score":useful_gain*3.0+max(0,starter_gain)*1.6+useful_their_gain*.9+acceptance*.12+fairness*.04,
             })
 
     seen=set()
     out=[]
-    for row in sorted(results,key=lambda x:(x["Tier"]=="Strong",x["Tier"]=="Realistic",x["_score"]),reverse=True):
+    priority={"League changer":4,"Clear upgrade":3,"Marginal upgrade":2,"Negligible":0}
+    for row in sorted(results,key=lambda x:(priority.get(x["Impact"],0),x["Acceptance"],x["_score"]),reverse=True):
         k=(row["You send"],row["You receive"])
         if k in seen:
             continue
@@ -848,7 +947,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V8 · V7.1 Engine LOCKED")
+st.sidebar.success("V8.1 · V7.1 Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
 with st.sidebar.expander("Player engine diagnostics"):
     st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
@@ -989,68 +1088,93 @@ elif page=="Player Engine":
     st.info("V8 keeps the V7.1 Sleeper-first player engine locked. FantasyPros only calibrates players it can confidently match; unmatched players retain full Sleeper-first values.")
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V8")
-    st.caption("Human-first trade intelligence built on the frozen V7.1 player engine.")
+    st.markdown("## Trade Centre V8.1.1")
+    st.caption("Objective-first trade intelligence: starter upgrades and real roster improvement come before bench churn.")
 
-    tab0,tab1,tab2,tab3,tab4=st.tabs(["Best offers","Target builder","Partner finder","Analyser","League market"])
+    my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
+    top_obj=my_objectives[0] if my_objectives else None
+    if top_obj:
+        st.markdown(
+            f'<div class="notice"><b>Current trade objective:</b> Improve <b>{top_obj["position"]}</b> '
+            f'({top_obj["score"]:.1f} priority score). V8.1 suppresses low-impact bench-for-bench swaps unless they clearly improve a starter path.</div>',
+            unsafe_allow_html=True
+        )
+
+    tab0,tab1,tab2,tab3,tab4=st.tabs(["Best upgrades","Target builder","Partner finder","Analyser","League market"])
 
     with tab0:
-        st.markdown('<div class="notice"><b>V8 only surfaces trades with a plausible human path to acceptance.</b> It applies starter value, best-player premium, consolidation tax, positional need, expendability and confidence — not just arithmetic value.</div>',unsafe_allow_html=True)
-        filt=st.selectbox("Show offers against",["All teams"]+[x for x in team_names if x!=my_name],key="v8_all_filter")
+        filt=st.selectbox("Show offers against",["All teams"]+[x for x in team_names if x!=my_name],key="v81_all_filter")
         suggestions=[]
         for partner in rosters:
             if partner["roster_id"]==my_rid: continue
             if filt!="All teams" and roster_names[partner["roster_id"]]!=filt: continue
-            for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,16):
+            for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,20):
                 row["Partner"]=roster_names[partner["roster_id"]]
                 suggestions.append(row)
 
         if suggestions:
-            sdf=pd.DataFrame(suggestions).sort_values(["Tier","Acceptance","_score"],ascending=[True,False,False])
-            for tier,title in [("Strong","Best realistic offers"),("Realistic","Worth proposing"),("Aggressive","Aggressive buy-low attempts")]:
-                subset=sdf[sdf["Tier"]==tier].sort_values(["Acceptance","_score"],ascending=[False,False])
+            sdf=pd.DataFrame(suggestions)
+            bands=["League changer","Clear upgrade","Marginal upgrade"]
+            labels={
+                "League changer":"League-changing upgrades",
+                "Clear upgrade":"Clear starter upgrades",
+                "Marginal upgrade":"Useful but smaller improvements",
+            }
+            for band in bands:
+                subset=sdf[sdf["Impact"]==band].sort_values(["Acceptance","_score"],ascending=[False,False])
                 if len(subset):
-                    st.markdown(f"### {title}")
-                    cols=["Partner","You send","You receive","Your impact","Their impact","Fairness","Acceptance","Market disagreement","Why"]
+                    st.markdown(f"### {labels[band]}")
+                    cols=["Partner","You send","You receive","Your impact","Starter upgrade","Their impact","Fairness","Acceptance","Why"]
                     st.dataframe(subset[cols].head(12),use_container_width=True,hide_index=True)
         else:
-            st.info("No generated trade currently clears V8's realism thresholds. Holding is better than manufacturing a fake offer.")
+            st.info("No trade currently clears V8.1's meaningful-improvement threshold. That is better than recommending pointless bench swaps.")
 
     with tab1:
         st.markdown("### Target builder")
-        partner_name=st.selectbox("Choose a manager",[x for x in team_names if x!=my_name],key="v8_target_partner")
+        partner_name=st.selectbox("Choose a manager",[x for x in team_names if x!=my_name],key="v81_target_partner")
         prid=team_options[partner_name]
         partner=next(r for r in rosters if r["roster_id"]==prid)
         target_rows=[x for x in roster_rows(partner,players,pick_map,rankings) if x["position"] in {"QB","RB","WR","TE"}]
-        target_name=st.selectbox("Player you want",[x["name"] for x in sorted(target_rows,key=lambda x:-x["value"])],key="v8_target_player")
+        target_name=st.selectbox("Player you want",[x["name"] for x in sorted(target_rows,key=lambda x:-x["value"])],key="v81_target_player")
         target=next(x for x in target_rows if x["name"]==target_name)
 
         proposals=[]
-        for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,60):
+        for row in generate_trade_suggestions(my_roster,partner,players,pick_map,rankings,80):
             if target_name in row["You receive"]:
                 proposals.append(row)
 
-        c1,c2,c3=st.columns(3)
+        c1,c2,c3,c4=st.columns(4)
         c1.metric("Target value",round(target["value"],1))
         c2.metric("Their expendability",f"{round(expendability(target,partner,players,pick_map,rankings))}%")
         c3.metric("Confidence",target.get("confidence","—"))
+        c4.metric("Your need",target["position"])
 
         if proposals:
-            pdf=pd.DataFrame(proposals).sort_values(["Acceptance","Your impact"],ascending=[False,False])
-            realistic=pdf[pdf["Acceptance"]>=55]
+            pdf=pd.DataFrame(proposals).sort_values(["Your impact","Acceptance"],ascending=[False,False])
             aggressive=pdf[(pdf["Acceptance"]>=38)&(pdf["Acceptance"]<55)]
+            realistic=pdf[pdf["Acceptance"]>=55]
+
             if len(aggressive):
-                r=aggressive.iloc[0]
-                st.markdown(f"**Opening offer:** {r['You send']} → **{target_name}**  \nAcceptance model: **{int(r['Acceptance'])}%**")
+                r=aggressive.sort_values(["Acceptance","Your impact"],ascending=[False,False]).iloc[0]
+                st.markdown(
+                    f"**Opening offer:** {r['You send']} → **{target_name}**  \n"
+                    f"Impact: **{r['Impact']} ({r['Your impact']:+.1f})** · acceptance **{int(r['Acceptance'])}%**"
+                )
             if len(realistic):
-                r=realistic.iloc[0]
-                st.markdown(f"**Likely fair deal:** {r['You send']} → **{target_name}**  \nAcceptance model: **{int(r['Acceptance'])}%**")
-                # walk-away uses highest human cost among plausible deals, but caps bad roster impact.
-                walk=realistic.sort_values("Human send",ascending=False).iloc[0]
-                st.markdown(f"**Walk-away price:** approximately **{walk['You send']}**. I would not automatically pay beyond this package.")
-            st.dataframe(pdf[["Tier","You send","Your impact","Their impact","Fairness","Acceptance","Why"]].head(15),use_container_width=True,hide_index=True)
+                r=realistic.sort_values(["Acceptance","Your impact"],ascending=[False,False]).iloc[0]
+                st.markdown(
+                    f"**Likely fair deal:** {r['You send']} → **{target_name}**  \n"
+                    f"Impact: **{r['Impact']} ({r['Your impact']:+.1f})** · acceptance **{int(r['Acceptance'])}%**"
+                )
+                walk=realistic.sort_values(["Receive value","Your impact"],ascending=[False,False]).iloc[0]
+                st.markdown(f"**Walk-away price:** roughly **{walk['You send']}**. Don't automatically go beyond that package.")
+
+            st.dataframe(
+                pdf[["Impact","Tier","You send","Your impact","Starter upgrade","Their impact","Fairness","Acceptance","Why"]].head(15),
+                use_container_width=True,hide_index=True
+            )
         else:
-            st.warning("V8 can't find a defensible package for this target from your current roster. That usually means the player is too expensive or the manager has little reason to sell.")
+            st.warning("No defensible package found for this target. Either the player is too expensive or the other manager has too little incentive to sell.")
 
     with tab2:
         st.markdown("### Partner finder")
@@ -1070,32 +1194,51 @@ elif page=="Trade Centre":
 
     with tab3:
         st.markdown("### Manual analyser")
-        partner_name=st.selectbox("Trade partner",[x for x in team_names if x!=my_name],key="v8_manual_partner")
+        partner_name=st.selectbox("Trade partner",[x for x in team_names if x!=my_name],key="v81_manual_partner")
         prid=team_options[partner_name]
         partner=next(r for r in rosters if r["roster_id"]==prid)
         mine={x["name"]:x for x in roster_rows(my_roster,players,pick_map,rankings)}
         theirs={x["name"]:x for x in roster_rows(partner,players,pick_map,rankings)}
         a,b=st.columns(2)
-        with a: give=st.multiselect("You give",list(mine.keys()),key="v8_manual_give")
-        with b: receive=st.multiselect("You receive",list(theirs.keys()),key="v8_manual_receive")
+        with a: give=st.multiselect("You give",list(mine.keys()),key="v81_manual_give")
+        with b: receive=st.multiselect("You receive",list(theirs.keys()),key="v81_manual_receive")
+
         gc=[mine[x] for x in give]; rc=[theirs[x] for x in receive]
         gv=human_trade_value(gc); rv=human_trade_value(rc)
+        fairness=100-abs(gv-rv)/max(gv,rv)*100 if gv and rv else 0
         cols=st.columns(4)
         cols[0].metric("Human send",round(gv,1))
         cols[1].metric("Human receive",round(rv,1))
         cols[2].metric("Raw edge",round(rv-gv,1))
-        fairness=100-abs(gv-rv)/max(gv,rv)*100 if gv and rv else 0
         cols[3].metric("Market fairness",f"{round(max(0,fairness))}%")
+
         if give and receive:
             mn=roster_after_trade(my_roster,[x["player_id"] for x in gc],[x["player_id"] for x in rc])
             tn=roster_after_trade(partner,[x["player_id"] for x in rc],[x["player_id"] for x in gc])
             mg=team_utility(mn,players,pick_map,rankings)-team_utility(my_roster,players,pick_map,rankings)
             tg=team_utility(tn,players,pick_map,rankings)-team_utility(partner,players,pick_map,rankings)
-            st.write({"Your roster impact":round(mg,1),"Their roster impact":round(tg,1)})
-            if fairness<72: st.error("Market values are too far apart.")
-            elif tg<-1: st.warning("Values may be close, but the other manager's roster gets materially worse.")
-            elif mg>0 and tg>=0: st.success("This has a plausible structure for both sides.")
-            else: st.info("Fair-ish value, but roster fit does not strongly support the deal.")
+            sg=projected_starting_upgrade(my_roster,rc,gc,players,pick_map,rankings)
+            you_reason, them_reason, _, _=trade_rationale(my_roster,partner,gc,rc,players,pick_map,rankings)
+
+            st.write({
+                "Your roster impact":round(mg,1),
+                "Your starter upgrade":round(sg,1),
+                "Their roster impact":round(tg,1),
+                "Impact class":impact_band(mg + max(0,sg)*.22),
+            })
+            st.markdown(f"**Why you do it:** {you_reason}")
+            st.markdown(f"**Why they do it:** {them_reason}")
+
+            if fairness<72:
+                st.error("Market values are too far apart.")
+            elif tg<-1:
+                st.warning("Fair-ish value, but the other roster gets materially worse.")
+            elif mg<.5 and sg<.75:
+                st.warning("This is mostly a lateral move. It probably isn't worth using trade capital on.")
+            elif mg>0 and tg>=0:
+                st.success("This has a plausible structure and meaningfully helps at least one roster objective.")
+            else:
+                st.info("The value is workable, but the strategic benefit is limited.")
 
     with tab4:
         st.markdown("### League market")
@@ -1115,7 +1258,7 @@ elif page=="Trade Centre":
             st.dataframe(pd.DataFrame(hist),use_container_width=True,hide_index=True)
             st.caption(f"{len(hist)} completed league trades available as behavioural context.")
         else:
-            st.info("No completed league trades yet. V8 is currently using roster construction and market-value behaviour only.")
+            st.info("No completed league trades yet. V8.1 is using roster construction and market-value behaviour only.")
 
 
 elif page=="Waivers":
