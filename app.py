@@ -563,24 +563,31 @@ def impact_band(v):
     return "Negligible"
 
 def roster_objectives(roster, players, pick_map, rankings):
-    """Rank the roster's actual upgrade priorities."""
+    """Rank actual upgrade priorities without over-inflating TE scarcity."""
     nd=needs(roster,players,pick_map,rankings)
     vals=pos_values(roster,players,pick_map,rankings)
 
     objectives=[]
+    starter_counts={"QB":1,"RB":2,"WR":2,"TE":1}
+    starter_floor={"QB":22,"RB":28,"WR":25,"TE":18}
+    depth_floor={"QB":10,"RB":14,"WR":13,"TE":8}
+    # TE is scarce, but scarcity is a tiebreaker—not a licence to overpay.
+    scarcity_bonus={"RB":2.2,"WR":1.8,"TE":0.9,"QB":0.5}
+
     for pos in ["QB","RB","WR","TE"]:
         need_score=float(nd.get(pos,0))
-        starters={"QB":1,"RB":2,"WR":2,"TE":1}.get(pos,1)
         arr=vals.get(pos,[])
-        starter_quality=sum(arr[:starters])/starters if arr else 0
-        depth_quality=sum(arr[starters:starters+2])/max(1,len(arr[starters:starters+2])) if len(arr)>starters else 0
-        scarcity_bonus={"RB":2.2,"WR":1.7,"TE":1.5,"QB":.6}.get(pos,1.0)
+        n=starter_counts[pos]
+        starter_quality=sum(arr[:n])/n if arr else 0
+        depth_slice=arr[n:n+2]
+        depth_quality=sum(depth_slice)/max(1,len(depth_slice)) if depth_slice else 0
 
-        score = need_score*1.6 + scarcity_bonus
-        if starter_quality < {"QB":22,"RB":28,"WR":25,"TE":18}[pos]:
-            score += 3.2
-        if depth_quality < {"QB":10,"RB":14,"WR":13,"TE":8}[pos]:
-            score += 1.0
+        starter_deficit=max(0,starter_floor[pos]-starter_quality)
+        depth_deficit=max(0,depth_floor[pos]-depth_quality)
+
+        score = need_score*1.35 + scarcity_bonus[pos]
+        score += starter_deficit*.16
+        score += depth_deficit*.06
 
         objectives.append({
             "position":pos,
@@ -588,9 +595,11 @@ def roster_objectives(roster, players, pick_map, rankings):
             "need":round(need_score,2),
             "starter_quality":round(starter_quality,2),
             "depth_quality":round(depth_quality,2),
+            "starter_deficit":round(starter_deficit,2),
         })
 
     return sorted(objectives,key=lambda x:x["score"],reverse=True)
+
 
 def objective_bonus(receive_combo, objectives):
     bypos={x["position"]:x for x in objectives}
@@ -598,12 +607,15 @@ def objective_bonus(receive_combo, objectives):
     reasons=[]
     for x in receive_combo:
         o=bypos.get(x["position"])
-        if not o: 
+        if not o:
             continue
-        if o["score"] >= 5:
-            score += min(4.5,o["score"]*.35)
+        pos_mult={"RB":1.0,"WR":1.0,"TE":0.55,"QB":0.70}.get(x["position"],1.0)
+        if o["score"] >= 4.5:
+            add=min(3.0,o["score"]*.24)*pos_mult
+            score += add
             reasons.append(f"targets your {x['position']} weakness")
     return score, reasons
+
 
 def projected_starting_upgrade(roster, receive_combo, give_combo, players, pick_map, rankings):
     """Approximate whether the deal improves a weekly starting slot, not just total depth."""
@@ -631,6 +643,39 @@ def projected_starting_upgrade(roster, receive_combo, give_combo, players, pick_
         after_total += sum(after_by.get(pos,[])[:n])
 
     return after_total-before_total
+
+def outgoing_opportunity_cost(roster, give_combo, players, pick_map, rankings):
+    """Penalty for weakening a starting position while chasing an upgrade elsewhere."""
+    before=roster_rows(roster,players,pick_map,rankings)
+    starters=[x for x in before if x.get("starter") and x["position"] in {"QB","RB","WR","TE"}]
+    starter_ids={x["player_id"] for x in starters}
+
+    cost=0.0
+    details=[]
+    for x in give_combo:
+        if x["player_id"] not in starter_ids:
+            continue
+        repl=starter_replacement_level(roster,players,pick_map,rankings,x["position"])
+        gap=max(0.0,float(x["value"])-repl)
+        # Losing a real WR/RB starter should hurt more than the old model allowed.
+        mult={"RB":1.0,"WR":1.0,"TE":0.75,"QB":0.55}.get(x["position"],1.0)
+        c=gap*.32*mult
+        cost+=c
+        if c>=.5:
+            details.append(f"weakens your {x['position']} room")
+    return cost, details
+
+def te_replacement_gain(roster, receive_combo, give_combo, players, pick_map, rankings):
+    """Measure TE improvement relative to the TE already available on the roster."""
+    incoming=[x for x in receive_combo if x["position"]=="TE"]
+    if not incoming:
+        return 0.0
+    before=[x for x in roster_rows(roster,players,pick_map,rankings) if x["position"]=="TE"]
+    current=max((x["value"] for x in before),default=0.0)
+    after_roster=roster_after_trade(roster,[x["player_id"] for x in give_combo],[x["player_id"] for x in receive_combo])
+    after=[x for x in roster_rows(after_roster,players,pick_map,rankings) if x["position"]=="TE"]
+    upgraded=max((x["value"] for x in after),default=0.0)
+    return max(0.0,upgraded-current)
 
 def trade_rationale(my_roster, partner, give_combo, receive_combo, players, pick_map, rankings):
     my_obj=roster_objectives(my_roster,players,pick_map,rankings)
@@ -692,9 +737,26 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 my_roster,partner,g,rc,players,pick_map,rankings
             )
 
-            # Objective-adjusted impact: starter upgrade and roster need are what make a trade worth doing.
-            useful_gain = my_gain + objective_gain*.38 + max(0,starter_gain)*.22
-            useful_their_gain = their_gain + their_objective_gain*.28 + max(0,their_starter_gain)*.14
+            # Objective-adjusted impact, now with opportunity cost and replacement-relative TE gain.
+            opp_cost, opp_notes = outgoing_opportunity_cost(my_roster,g,players,pick_map,rankings)
+            their_opp_cost, _ = outgoing_opportunity_cost(partner,rc,players,pick_map,rankings)
+            te_gain = te_replacement_gain(my_roster,rc,g,players,pick_map,rankings)
+            their_te_gain = te_replacement_gain(partner,g,rc,players,pick_map,rankings)
+
+            useful_gain = (
+                my_gain
+                + objective_gain*.28
+                + max(0,starter_gain)*.28
+                + min(2.0,te_gain*.08)
+                - opp_cost
+            )
+            useful_their_gain = (
+                their_gain
+                + their_objective_gain*.22
+                + max(0,their_starter_gain)*.16
+                + min(1.4,their_te_gain*.06)
+                - their_opp_cost
+            )
 
             # V8.1 key rule: don't clutter recommendations with pointless bench swaps.
             receives_starter_upgrade = starter_gain >= .75
@@ -704,10 +766,20 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             )
             consolidation = len(g)>len(rc) and max(x["value"] for x in rc) > max(x["value"] for x in g)*1.08
 
+            # If the incoming centerpiece is a TE, it must create a genuine replacement-level gain.
+            incoming_positions={x["position"] for x in rc}
+            sends_core_skill_starter=any(
+                x.get("starter") and x["position"] in {"RB","WR"} and x["value"]>=18
+                for x in g
+            )
+            if "TE" in incoming_positions and sends_core_skill_starter:
+                if te_gain < 4.0 or useful_gain < 1.35:
+                    continue
+
             meaningful = (
                 useful_gain >= 1.15
                 or starter_gain >= 1.25
-                or (receives_priority_asset and useful_gain >= .75)
+                or (receives_priority_asset and useful_gain >= .85)
                 or consolidation
             )
             if not meaningful:
@@ -751,7 +823,17 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             else:
                 market_flag="Low"
 
-            band=impact_band(useful_gain)
+            # Classification now reflects actual starting-lineup benefit.
+            if useful_gain >= 3.0 and starter_gain >= 1.0:
+                band="League changer"
+            elif starter_gain >= .75 and useful_gain >= 1.25:
+                band="Clear upgrade"
+            elif useful_gain >= .75:
+                band="Roster improvement"
+            elif useful_gain >= .5:
+                band="Marginal upgrade"
+            else:
+                band="Negligible"
             if band=="Negligible":
                 continue
 
@@ -766,6 +848,8 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             why=[]
             if you_reason:
                 why.append("YOU: "+you_reason)
+            if opp_notes:
+                why.append("COST: "+", ".join(opp_notes))
             if them_reason:
                 why.append("THEM: "+them_reason)
             if len(g)>len(rc):
@@ -793,7 +877,7 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
 
     seen=set()
     out=[]
-    priority={"League changer":4,"Clear upgrade":3,"Marginal upgrade":2,"Negligible":0}
+    priority={"League changer":5,"Clear upgrade":4,"Roster improvement":3,"Marginal upgrade":2,"Negligible":0}
     for row in sorted(results,key=lambda x:(priority.get(x["Impact"],0),x["Acceptance"],x["_score"]),reverse=True):
         k=(row["You send"],row["You receive"])
         if k in seen:
@@ -947,7 +1031,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V8.1 · V7.1 Engine LOCKED")
+st.sidebar.success("V8.2 · V7.1 Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
 with st.sidebar.expander("Player engine diagnostics"):
     st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
@@ -1088,7 +1172,7 @@ elif page=="Player Engine":
     st.info("V8 keeps the V7.1 Sleeper-first player engine locked. FantasyPros only calibrates players it can confidently match; unmatched players retain full Sleeper-first values.")
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V8.1.1")
+    st.markdown("## Trade Centre V8.2.1")
     st.caption("Objective-first trade intelligence: starter upgrades and real roster improvement come before bench churn.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
@@ -1096,7 +1180,7 @@ elif page=="Trade Centre":
     if top_obj:
         st.markdown(
             f'<div class="notice"><b>Current trade objective:</b> Improve <b>{top_obj["position"]}</b> '
-            f'({top_obj["score"]:.1f} priority score). V8.1 suppresses low-impact bench-for-bench swaps unless they clearly improve a starter path.</div>',
+            f'({top_obj["score"]:.1f} priority score). V8.2 suppresses low-impact bench swaps and now prices TE upgrades relative to your existing TE while charging full opportunity cost for losing RB/WR starters.</div>',
             unsafe_allow_html=True
         )
 
@@ -1114,10 +1198,11 @@ elif page=="Trade Centre":
 
         if suggestions:
             sdf=pd.DataFrame(suggestions)
-            bands=["League changer","Clear upgrade","Marginal upgrade"]
+            bands=["League changer","Clear upgrade","Roster improvement","Marginal upgrade"]
             labels={
                 "League changer":"League-changing upgrades",
                 "Clear upgrade":"Clear starter upgrades",
+                "Roster improvement":"Meaningful roster improvements",
                 "Marginal upgrade":"Useful but smaller improvements",
             }
             for band in bands:
@@ -1224,7 +1309,7 @@ elif page=="Trade Centre":
                 "Your roster impact":round(mg,1),
                 "Your starter upgrade":round(sg,1),
                 "Their roster impact":round(tg,1),
-                "Impact class":impact_band(mg + max(0,sg)*.22),
+                "Impact class":("League changer" if mg>=3 and sg>=1 else "Clear upgrade" if sg>=.75 and mg>=1.25 else "Roster improvement" if mg>=.75 else "Marginal upgrade" if mg>=.5 else "Negligible"),
             })
             st.markdown(f"**Why you do it:** {you_reason}")
             st.markdown(f"**Why they do it:** {them_reason}")
