@@ -1,10 +1,9 @@
-# Sleeper GM
+# Sleeper GM V7
+Sleeper-first architectural reset.
 
-
-## V6.2 — FantasyPros Coverage
-- Pages through FantasyPros ranking responses instead of accepting the default small result set.
-- Requests larger result limits where supported.
-- Normalizes player names across punctuation, accents, suffixes (Jr/II/III/etc.).
-- Tracks coverage specifically for fantasy-relevant rostered QB/RB/WR/TE players.
-- Sidebar diagnostics show ranking records, matched players, and coverage percentage.
-- Keeps Sleeper/draft-market fallback values for unmatched players instead of pretending coverage is complete.
+- Sleeper is the source of truth for player identity, rosters and league state.
+- Every rostered player receives a value.
+- League draft price + Sleeper market/depth form the universal base.
+- FantasyPros ECR/ADP are optional external adjustments.
+- Player Engine page exposes value, confidence and contributing signals.
+- Trade/waiver recalibration comes after validating this stable player layer.

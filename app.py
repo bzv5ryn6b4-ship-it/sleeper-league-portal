@@ -6,7 +6,6 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
-from difflib import SequenceMatcher
 
 import pandas as pd
 import requests
@@ -105,7 +104,7 @@ def fp_get(path, key):
         return None
     r = requests.get(
         f"{FP}{path}",
-        headers={"x-api-key": key, "User-Agent": "SleeperGM/6.4"},
+        headers={"x-api-key": key, "User-Agent": "SleeperGM/6.1"},
         timeout=20,
     )
     r.raise_for_status()
@@ -131,7 +130,7 @@ def fp_diagnostics(season, key, scoring="PPR"):
         return diag
     try:
         url=f"{FP}/nfl/{season}/consensus-rankings?position=RB&scoring={scoring}"
-        r=requests.get(url,headers={"x-api-key":key,"User-Agent":"SleeperGM/6.4"},timeout=20)
+        r=requests.get(url,headers={"x-api-key":key,"User-Agent":"SleeperGM/6.1"},timeout=20)
         diag["status"]=r.status_code
         if not r.ok:
             diag["message"]=f"FantasyPros HTTP {r.status_code}: {r.text[:180]}"
@@ -206,91 +205,6 @@ def fp_rankings(season, key, scoring="PPR"):
         except Exception:
             pass
     return out
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fp_players(key):
-    """Canonical FantasyPros NFL player identity layer (independent of ECR coverage)."""
-    if not key:
-        return []
-    try:
-        return flatten_rows(fp_get("/nfl/players", key))
-    except Exception:
-        return []
-
-def _fp_player_meta(x):
-    name=x.get("player_name") or x.get("name") or " ".join(
-        y for y in [x.get("first_name") or x.get("player_first_name"), x.get("last_name") or x.get("player_last_name")] if y
-    ).strip()
-    pos=x.get("position_id") or x.get("primary_position") or x.get("position")
-    if not pos:
-        ps=x.get("positions")
-        if isinstance(ps,list) and ps: pos=ps[0]
-    team=x.get("team_id") or x.get("player_team_id") or x.get("team")
-    return {"fp_id":x.get("player_id") or x.get("id"),"name":name,"position":pos,"team":team}
-
-def build_fp_identity(rosters, sleeper_players, fp_player_rows, rankings):
-    """Map every rostered Sleeper player to a canonical FP identity where possible.
-
-    Matching order: exact normalized name -> exact name + position/team tie-break ->
-    conservative fuzzy match constrained by position. Ranked data is then aliased onto
-    the Sleeper name, so the rest of the app can keep using its existing value model.
-    """
-    fp=[]
-    by_name=defaultdict(list)
-    for raw in fp_player_rows:
-        m=_fp_player_meta(raw)
-        if not m["name"]: continue
-        m["key"]=normalize_player_name(m["name"])
-        fp.append(m); by_name[m["key"]].append(m)
-
-    rostered=[]
-    seen=set()
-    for r in rosters:
-        for pid in r.get("players") or []:
-            pid=str(pid)
-            if pid in seen: continue
-            seen.add(pid); rostered.append(pmeta(pid,sleeper_players))
-
-    identity={}; unresolved=[]
-    for sm in rostered:
-        sk=normalize_player_name(sm["name"]); candidates=by_name.get(sk,[])
-        match=None; method=None; confidence=0
-        if len(candidates)==1:
-            match=candidates[0]; method="exact name"; confidence=100
-        elif candidates:
-            scored=[]
-            for c in candidates:
-                score=90
-                if sm.get("position") and c.get("position")==sm.get("position"): score+=6
-                if sm.get("team") and c.get("team")==sm.get("team"): score+=4
-                scored.append((score,c))
-            score,match=max(scored,key=lambda z:z[0]); method="exact + metadata"; confidence=score
-        else:
-            # Only fuzzy-match plausible same-position players; threshold is deliberately strict.
-            pool=[c for c in fp if not sm.get("position") or c.get("position")==sm.get("position")]
-            best=None
-            for c in pool:
-                ratio=SequenceMatcher(None,sk,c["key"]).ratio()
-                bonus=.03 if sm.get("team") and c.get("team")==sm.get("team") else 0
-                score=ratio+bonus
-                if best is None or score>best[0]: best=(score,c)
-            if best and best[0]>=.91:
-                match=best[1]; method="fuzzy + position"; confidence=round(min(99,best[0]*100),1)
-        if match:
-            ranked=bool(rankings.get(match["key"]) or rankings.get(sk))
-            identity[sm["player_id"]]={**match,"sleeper_name":sm["name"],"method":method,"confidence":confidence,"ranked":ranked}
-            # Critical bridge: existing engine can look up by Sleeper name even when FP spelling differs.
-            if match["key"] in rankings and sk not in rankings:
-                rankings[sk]=dict(rankings[match["key"]])
-        else:
-            unresolved.append({"Player":sm["name"],"Pos":sm.get("position"),"NFL":sm.get("team"),"Sleeper ID":sm["player_id"],"Reason":"No safe FantasyPros identity match"})
-
-    ranked=sum(1 for m in identity.values() if m.get("ranked"))
-    return identity, unresolved, {
-        "total":len(rostered),"identified":len(identity),"ranked":ranked,
-        "fallback":max(0,len(rostered)-ranked),"unresolved":len(unresolved)
-    }
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fp_weekly_projections(season, week, key, scoring="PPR"):
@@ -420,45 +334,50 @@ def consolidation_premium(combo):
     if v >= 20: return 1.08
     return 1.04
 
-def player_value(meta, pick_map, rankings):
-    name_key=normalize_player_name(meta["name"])
-    ext, disagreement=external_signal(ranking_lookup(rankings, meta["name"])) if rankings else (0.0,0.0)
-    drafted=pick_value(pick_map.get(meta["player_id"]))
-    sleeper=search_value(meta.get("search_rank"))
-    if ext:
-        # External expert/market data leads, but the actual Sleeper league draft
-        # and Sleeper's own market/search signal remain meaningful.
-        raw=ext*.60+drafted*.28+sleeper*.12
-    elif drafted:
-        raw=drafted*.78+sleeper*.22
-    else:
-        raw=sleeper
-    pos_mult={"RB":1.05,"WR":1.0,"TE":.95,"QB":.88,"K":.28,"DEF":.30}.get(meta["position"],.60)
-    age_mult=1.0
-    age=meta["age"]
-    if meta["position"] in {"RB","WR","TE"} and isinstance(age,(int,float)):
-        if age<=24: age_mult=1.04
-        elif age>=31: age_mult=.94
-    depth_mult=1.0
-    d=meta.get("depth")
-    if meta["position"] in {"RB","WR","TE"}:
-        if d==1: depth_mult=1.05
-        elif d==2: depth_mult=1.01
-        elif isinstance(d,(int,float)) and d>=4: depth_mult=.92
-    return raw*pos_mult*age_mult*depth_mult*injury_mult(meta["injury"])
+def value_source(meta,pick_map,rankings):
+    rr=ranking_lookup(rankings,meta.get("name")) if rankings else {}
+    sig=[]
+    if rr.get("ecr") is not None: sig.append("FP ECR")
+    if rr.get("adp") is not None: sig.append("FP ADP")
+    if pick_map.get(meta.get("player_id")) is not None: sig.append("League draft")
+    if meta.get("search_rank") is not None: sig.append("Sleeper market")
+    if meta.get("depth") is not None: sig.append("Depth chart")
+    return sig
 
-def roster_rows(roster, players, pick_map, rankings):
+def value_confidence(meta,pick_map,rankings):
+    sig=value_source(meta,pick_map,rankings)
+    score=3*("FP ECR" in sig)+2*("FP ADP" in sig)+2*("League draft" in sig)+("Sleeper market" in sig)+("Depth chart" in sig)
+    return "Very High" if score>=7 else "High" if score>=5 else "Medium" if score>=3 else "Low"
+
+def sleeper_market_value(meta):
+    base=search_value(meta.get("search_rank"))
+    d=meta.get("depth"); pos=meta.get("position")
+    mult=1.08 if pos in {"RB","WR","TE"} and d==1 else 1.03 if pos in {"RB","WR","TE"} and d==2 else .91 if pos in {"RB","WR","TE"} and isinstance(d,(int,float)) and d>=4 else 1.0
+    return base*mult
+
+def player_value(meta,pick_map,rankings):
+    rr=ranking_lookup(rankings,meta["name"]) if rankings else {}
+    ext,_=external_signal(rr) if rr else (0.0,0.0)
+    drafted=pick_value(pick_map.get(meta["player_id"]))
+    sleeper=sleeper_market_value(meta)
+    base=drafted*.58+sleeper*.42 if drafted and sleeper else drafted or sleeper
+    raw=base*.68+ext*.32 if ext and base else ext or base
+    pm={"RB":1.05,"WR":1.0,"TE":.95,"QB":.88,"K":.28,"DEF":.30}.get(meta.get("position"),.60)
+    return max(0.0,raw*pm*injury_mult(meta.get("injury")))
+
+def roster_rows(roster,players,pick_map,rankings):
     starters={str(x) for x in (roster.get("starters") or [])}
     out=[]
     for pid in roster.get("players") or []:
-        m=pmeta(pid,players)
-        m["starter"]=str(pid) in starters
+        m=pmeta(pid,players); m["starter"]=str(pid) in starters
         m["value"]=round(player_value(m,pick_map,rankings),2)
         rr=ranking_lookup(rankings,m["name"]) if rankings else {}
-        m["ecr"]=rr.get("ecr")
-        m["adp"]=rr.get("adp")
-        _,dis=external_signal(rr)
+        m["ecr"]=rr.get("ecr"); m["adp"]=rr.get("adp")
+        _,dis=external_signal(rr) if rr else (0.0,0.0)
         m["market_disagreement"]=round(dis*100,1) if dis else 0.0
+        sig=value_source(m,pick_map,rankings)
+        m["value_source"]=" + ".join(sig) if sig else "Sleeper fallback"
+        m["confidence"]=value_confidence(m,pick_map,rankings)
         out.append(m)
     return out
 
@@ -735,8 +654,6 @@ rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
 fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
 rankings=fp_rankings(season,key,fp_scoring) if key else {}
 fp_diag=fp_diagnostics(season,key,fp_scoring)
-fp_player_rows=fp_players(key) if key else []
-fp_identity, fp_unresolved, coverage=build_fp_identity(rosters,players,fp_player_rows,rankings) if key else ({},[],{"total":sum(len(r.get("players") or []) for r in rosters),"identified":0,"ranked":0,"fallback":0,"unresolved":0})
 fp_active=bool(fp_diag.get("ok") and rankings)
 
 user_map={str(u.get("user_id")):u for u in users}
@@ -750,6 +667,18 @@ except Exception: drafts=[]
 latest=sorted(drafts,key=lambda x:x.get("created",0) or 0,reverse=True)[0] if drafts else None
 picks=sleeper_get(f"/draft/{latest['draft_id']}/picks") if latest else []
 pick_map={str(x.get("player_id")):x.get("pick_no") for x in picks if x.get("player_id") is not None}
+engine_rows=[]
+for _r in rosters:
+    for _pid in (_r.get("players") or []):
+        _m=pmeta(_pid,players)
+        if _m.get("position") in {"QB","RB","WR","TE","K","DEF"}:
+            _rr=ranking_lookup(rankings,_m["name"]) if rankings else {}
+            engine_rows.append({"name":_m["name"],"fp":bool(_rr.get("ecr") is not None or _rr.get("adp") is not None)})
+engine_total=len(engine_rows)
+engine_identified=sum(1 for x in engine_rows if x["name"])
+engine_fp=sum(1 for x in engine_rows if x["fp"])
+engine_fallback=engine_total-engine_fp
+
 
 team_options={roster_names[r["roster_id"]]:r["roster_id"] for r in rosters}
 team_names=list(team_options.keys())
@@ -785,41 +714,15 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-if fp_active:
-    st.sidebar.success(f"FantasyPros ACTIVE · {fp_scoring}")
-    st.sidebar.caption(
-        f"{coverage['identified']}/{coverage['total']} players identified · "
-        f"{coverage['ranked']} FP ranked · {coverage['fallback']} fallback valued"
-    )
-    if coverage["unresolved"]:
-        st.sidebar.warning(f"{coverage['unresolved']} player identities unresolved")
-else:
-    st.sidebar.warning("Sleeper fallback model active")
-    st.sidebar.caption(fp_diag.get("message") or "FantasyPros did not return usable ranking data.")
+st.sidebar.success("V7 Player Engine ACTIVE")
+st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
+with st.sidebar.expander("Player engine diagnostics"):
+    st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
+    st.caption("FantasyPros is optional. Missing external rankings no longer means a player is missing from the engine.")
+    if st.button("Clear API caches and retry",key="v7cache"):
+        st.cache_data.clear(); st.rerun()
 
-with st.sidebar.expander("FantasyPros diagnostics"):
-    st.write({
-        "Key detected": bool(key),
-        "HTTP status": fp_diag.get("status"),
-        "Test rows": fp_diag.get("rows"),
-        "Ranking records": len(rankings),
-        "FP player records": len(fp_player_rows),
-        "Roster players identified": f"{coverage['identified']}/{coverage['total']}",
-        "Roster players FP ranked": coverage['ranked'],
-        "Roster players fallback valued": coverage['fallback'],
-        "Unresolved identities": coverage['unresolved'],
-        "Mode": "FantasyPros + Sleeper" if fp_active else "Sleeper fallback",
-    })
-    st.caption(fp_diag.get("message", ""))
-    if fp_unresolved:
-        with st.expander("Unresolved roster players"):
-            st.dataframe(pd.DataFrame(fp_unresolved),use_container_width=True,hide_index=True)
-    if key and not fp_active:
-        if st.button("Clear API caches and retry"):
-            st.cache_data.clear()
-            st.rerun()
-
-PAGES=["Home","Power Rankings","My Team","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
+PAGES=["Home","Power Rankings","My Team","Player Engine","Trade Centre","Waivers","Matchup Scout","Lineup","League Activity","Rosters","Export"]
 page=st.sidebar.radio("Navigate",PAGES)
 st.sidebar.markdown("---")
 st.sidebar.caption(f"{league.get('name','League')} · {league.get('season','')}")
@@ -835,7 +738,7 @@ rank={x["rid"]:i+1 for i,x in enumerate(power)}
 pscore={x["rid"]:x["score"] for x in power}
 
 st.markdown(
-    f'<div class="hero"><div class="kicker">Fantasy GM Command Centre</div>'
+    f'<div class="hero"><div class="kicker">Sleeper GM V7</div>'
     f'<h1>{my_name}</h1><p>{league.get("name","Sleeper League")} · live roster intelligence</p></div>',
     unsafe_allow_html=True
 )
@@ -924,8 +827,23 @@ elif page=="My Team":
 # TRADE CENTRE V2
 # ============================================================
 
+elif page=="Player Engine":
+    st.markdown("## Player Engine · V7")
+    st.caption("Sleeper is the identity layer. External rankings improve confidence but are never required.")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Recognised",f"{engine_identified}/{engine_total}")
+    c2.metric("External ranked",engine_fp)
+    c3.metric("Sleeper fallback",engine_fallback)
+    erows=[]
+    for r in rosters:
+        for x in roster_rows(r,players,pick_map,rankings):
+            if x["position"] in {"QB","RB","WR","TE","K","DEF"}:
+                erows.append({"Player":x["name"],"Pos":x["position"],"NFL":x["team"],"Owner":roster_names[r["roster_id"]],"Value":x["value"],"Confidence":x["confidence"],"Signals":x["value_source"],"FP ECR":x.get("ecr"),"FP ADP":x.get("adp")})
+    st.dataframe(pd.DataFrame(erows).sort_values(["Value","Player"],ascending=[False,True]),use_container_width=True,hide_index=True)
+    st.info("Every Sleeper rostered player is now part of the valuation engine. FantasyPros is an optional adjustment, not an identity requirement.")
+
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V6.4")
+    st.markdown("## Trade Centre · V7 foundation")
     tab0,tab1,tab2,tab3=st.tabs(["Suggested trades","Targets","Partner finder","Analyser"])
 
     with tab0:
@@ -933,7 +851,7 @@ elif page=="Trade Centre":
             st.success(f"FantasyPros data verified: {len(rankings)} ranking records loaded. Trade values are using ECR + ADP + Sleeper league data.")
         else:
             st.warning(f"FantasyPros is NOT contributing to trade values right now. {fp_diag.get('message','')} Suggestions below use the Sleeper fallback model.")
-        st.markdown('<div class="notice"><b>Suggested Trades V6.4</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
+        st.markdown('<div class="notice"><b>Suggested Trades · V7 foundation</b> uses league-specific Sleeper data, roster impact, consolidation premiums and — when connected — separate FantasyPros ECR + ADP signals. Deals must improve both teams and clear a conservative acceptance threshold.</div>',unsafe_allow_html=True)
         filt=st.selectbox("Show suggestions against",["All teams"]+[x for x in team_names if x!=my_name])
         suggestions=[]
         for partner in rosters:
