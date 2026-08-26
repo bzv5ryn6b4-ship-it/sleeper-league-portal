@@ -282,9 +282,14 @@ def is_current_nfl_player(raw_player):
     return True
 
 def pick_value(pick_no):
+    """Draft capital is useful early, then deliberately fades as current-season evidence grows."""
     if not pick_no: return 0.0
     p=max(1,float(pick_no))
-    return 92/(p**0.38)
+    base=92/(p**0.38)
+    week=max(1,int(globals().get("CURRENT_WEEK",1) or 1))
+    # 100% in Week 1, ~70% by Week 9, ~48% by fantasy playoffs.
+    decay=max(.42, 1.0-(week-1)*.038)
+    return base*decay
 
 def search_value(rank):
     try: r=float(rank)
@@ -352,25 +357,40 @@ def value_confidence(meta,pick_map,rankings):
 def sleeper_market_value(meta):
     base=search_value(meta.get("search_rank"))
     d=meta.get("depth"); pos=meta.get("position")
-    mult=1.08 if pos in {"RB","WR","TE"} and d==1 else 1.03 if pos in {"RB","WR","TE"} and d==2 else .91 if pos in {"RB","WR","TE"} and isinstance(d,(int,float)) and d>=4 else 1.0
-    return base*mult
+    # Role matters most at positions where opportunity drives fantasy output.
+    role={1:1.13,2:1.04,3:.97}.get(d, .88 if isinstance(d,(int,float)) and d>=4 else 1.0)
+    if pos=="QB": role={1:1.07,2:.82,3:.68}.get(d,.72 if d else 1.0)
+    return base*role
+
+def position_curve(pos, raw):
+    """League-aware scarcity curve. Elite RB/WR/TE assets separate; 1QB depth compresses."""
+    scarcity=globals().get("POS_SCARCITY",{})
+    mult={"RB":1.08,"WR":1.03,"TE":1.00,"QB":.82,"K":.24,"DEF":.27}.get(pos,.55)
+    mult*=scarcity.get(pos,1.0)
+    x=max(0.0,raw*mult)
+    # Gentle elite premium; avoids making ordinary depth assets look like stars.
+    if pos in {"RB","WR"} and x>28: x=28+(x-28)*1.10
+    elif pos=="TE" and x>24: x=24+(x-24)*1.08
+    elif pos=="QB" and x>32: x=32+(x-32)*1.04
+    return x
 
 def player_value(meta,pick_map,rankings):
     rr=ranking_lookup(rankings,meta["name"]) if rankings else {}
     ext,_=external_signal(rr) if rr else (0.0,0.0)
     drafted=pick_value(pick_map.get(meta["player_id"]))
     sleeper=sleeper_market_value(meta)
-    base=drafted*.58+sleeper*.42 if drafted and sleeper else drafted or sleeper
-    raw=base*.68+ext*.32 if ext and base else ext or base
-    pm={"RB":1.05,"WR":1.0,"TE":.95,"QB":.88,"K":.28,"DEF":.30}.get(meta.get("position"),.60)
-    return max(0.0,raw*pm*injury_mult(meta.get("injury")))
+    base=drafted*.54+sleeper*.46 if drafted and sleeper else drafted or sleeper
+    # External consensus is a corroborating signal, never the identity/value engine.
+    ext_weight=.28 if rr.get("ecr") is not None and rr.get("adp") is not None else .18 if ext else 0
+    raw=base*(1-ext_weight)+ext*ext_weight if ext and base else ext or base
+    return max(0.0,position_curve(meta.get("position"),raw)*injury_mult(meta.get("injury")))
 
 def roster_rows(roster,players,pick_map,rankings):
     starters={str(x) for x in (roster.get("starters") or [])}
     out=[]
     for pid in roster.get("players") or []:
         m=pmeta(pid,players); m["starter"]=str(pid) in starters
-        m["value"]=round(player_value(m,pick_map,rankings),2)
+        m["value"]=round(player_value(m,pick_map,rankings)*(1.035 if m["starter"] and m.get("position") in {"RB","WR","TE"} else 1.015 if m["starter"] and m.get("position")=="QB" else 1.0),2)
         rr=ranking_lookup(rankings,m["name"]) if rankings else {}
         m["ecr"]=rr.get("ecr"); m["adp"]=rr.get("adp")
         _,dis=external_signal(rr) if rr else (0.0,0.0)
@@ -649,6 +669,21 @@ except Exception as e:
     st.stop()
 
 season=int(league.get("season") or 2026)
+try:
+    nfl_state=sleeper_get("/state/nfl")
+    CURRENT_WEEK=int(nfl_state.get("week") or 1)
+except Exception:
+    CURRENT_WEEK=1
+# League-format scarcity: required starter slots determine replacement pressure.
+slots=league.get("roster_positions") or []
+slot_counts=Counter(slots)
+POS_SCARCITY={
+    "QB": .88 if slot_counts.get("QB",0)<=1 and "SUPER_FLEX" not in slots else 1.14,
+    "RB": 1.05 if slot_counts.get("RB",0)>=2 else 1.0,
+    "WR": 1.04 if slot_counts.get("WR",0)>=2 else 1.0,
+    "TE": 1.03 if slot_counts.get("TE",0)>=1 else .96,
+    "K": .85, "DEF": .88,
+}
 key=fp_key()
 rec_pts=float((league.get("scoring_settings") or {}).get("rec",0) or 0)
 fp_scoring="PPR" if rec_pts>=.75 else ("HALF" if rec_pts>=.25 else "STD")
@@ -714,7 +749,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V7 Player Engine ACTIVE")
+st.sidebar.success("V7.1 Player Engine ACTIVE")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} external-ranked · {engine_fallback} Sleeper-first fallback")
 with st.sidebar.expander("Player engine diagnostics"):
     st.write({"Recognised":f"{engine_identified}/{engine_total}","FantasyPros ranked":engine_fp,"Sleeper-first fallback":engine_fallback,"FantasyPros API":"Connected" if fp_active else "Optional / unavailable","Model":"Sleeper-first multi-source"})
@@ -828,19 +863,31 @@ elif page=="My Team":
 # ============================================================
 
 elif page=="Player Engine":
-    st.markdown("## Player Engine · V7")
-    st.caption("Sleeper is the identity layer. External rankings improve confidence but are never required.")
-    c1,c2,c3=st.columns(3)
+    st.markdown("## Player Engine · V7.1 Calibration")
+    st.caption("League-aware positional curves, role weighting, decaying draft capital and confidence-weighted external consensus.")
+    c1,c2,c3,c4=st.columns(4)
     c1.metric("Recognised",f"{engine_identified}/{engine_total}")
     c2.metric("External ranked",engine_fp)
     c3.metric("Sleeper fallback",engine_fallback)
+    c4.metric("Draft weight",f"{max(42,round((1-(max(1,CURRENT_WEEK)-1)*.038)*100))}%",f"Week {CURRENT_WEEK}")
     erows=[]
     for r in rosters:
         for x in roster_rows(r,players,pick_map,rankings):
             if x["position"] in {"QB","RB","WR","TE","K","DEF"}:
-                erows.append({"Player":x["name"],"Pos":x["position"],"NFL":x["team"],"Owner":roster_names[r["roster_id"]],"Value":x["value"],"Confidence":x["confidence"],"Signals":x["value_source"],"FP ECR":x.get("ecr"),"FP ADP":x.get("adp")})
-    st.dataframe(pd.DataFrame(erows).sort_values(["Value","Player"],ascending=[False,True]),use_container_width=True,hide_index=True)
-    st.info("Every Sleeper rostered player is now part of the valuation engine. FantasyPros is an optional adjustment, not an identity requirement.")
+                erows.append({"Player":x["name"],"Pos":x["position"],"NFL":x["team"],"Owner":roster_names[r["roster_id"]],"Value":x["value"],"Starter":x["starter"],"Depth":x.get("depth"),"Confidence":x["confidence"],"Signals":x["value_source"],"FP ECR":x.get("ecr"),"FP ADP":x.get("adp"),"Disagreement %":x.get("market_disagreement",0)})
+    edf=pd.DataFrame(erows).sort_values(["Value","Player"],ascending=[False,True])
+    tabs=st.tabs(["Overall audit","By position","Disagreements","Low confidence"])
+    with tabs[0]:
+        st.dataframe(edf.head(50),use_container_width=True,hide_index=True)
+    with tabs[1]:
+        pos=st.selectbox("Audit position",["QB","RB","WR","TE","K","DEF"])
+        st.dataframe(edf[edf["Pos"]==pos].head(40),use_container_width=True,hide_index=True)
+    with tabs[2]:
+        st.caption("Players where FantasyPros ECR and ADP disagree most. These deserve human review before the trade engine trusts them heavily.")
+        st.dataframe(edf.sort_values("Disagreement %",ascending=False).head(30),use_container_width=True,hide_index=True)
+    with tabs[3]:
+        st.dataframe(edf[edf["Confidence"].isin(["Low","Medium"])].sort_values("Value",ascending=False).head(50),use_container_width=True,hide_index=True)
+    st.info("V7.1 keeps Sleeper as source of truth. FantasyPros only calibrates players it can confidently match; unmatched players retain full Sleeper-first values.")
 
 elif page=="Trade Centre":
     st.markdown("## Trade Centre · V7 foundation")
