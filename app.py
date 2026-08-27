@@ -986,6 +986,43 @@ def opportunity_bucket(row):
 
     return "Hide"
 
+
+def v10_2_actionability(row):
+    """Rank trades by usefulness + realism, not raw lineup gain alone."""
+    lineup=float(row.get("Lineup gain",0))
+    impact=float(row.get("Your impact",0))
+    depth=float(row.get("Depth change",0))
+    partner=float(row.get("Their impact",0))
+    acceptance=float(row.get("Acceptance",0))
+    fairness=float(row.get("Fairness",0))
+
+    # Reward actual weekly improvement and realistic acceptance.
+    score = (
+        max(0,lineup)*3.2
+        + max(0,impact)*2.0
+        + acceptance*.075
+        + fairness*.035
+        + max(-1.5,partner)*.8
+        + min(1.5,depth)*.35
+    )
+    # Penalise dream offers harder.
+    if partner < -1.5:
+        score -= abs(partner+1.5)*2.4
+    if acceptance < 35:
+        score -= 3.0
+    return round(score,2)
+
+def v10_2_bucket(row):
+    verdict=str(row.get("Verdict",""))
+    acc=float(row.get("Acceptance",0))
+    partner=float(row.get("Their impact",0))
+    lineup=float(row.get("Lineup gain",0))
+    if verdict in {"SEND","NEGOTIATE"} and acc>=45 and partner>=-1.0:
+        return "Best moves now"
+    if lineup>=1.0 and verdict=="LONG SHOT":
+        return "Swing-for-the-fences"
+    return "Other"
+
 def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, max_results=20):
     mine=[x for x in roster_rows(my_roster,players,pick_map,rankings)
           if x["position"] in {"QB","RB","WR","TE"} and x["value"]>=4]
@@ -1198,6 +1235,8 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             row_out["Bucket"]=opportunity_bucket(row_out)
             row_out["Offer quality"]=offer_quality(row_out)
             row_out["Target note"]=target_gap_label(row_out)
+            row_out["Actionability"]=v10_2_actionability(row_out)
+            row_out["V10.2 group"]=v10_2_bucket(row_out)
             if row_out["Bucket"]!="Hide":
                 results.append(row_out)
 
@@ -1361,7 +1400,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V10.1 · V9.1 Valuation Engine LOCKED")
+st.sidebar.success("V10.2 · V9.1 Valuation Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} FantasyPros-ranked · {engine_fallback} Sleeper-first fallback")
 st.sidebar.caption(
     ("FantasyCalc market connected · " + str(MARKET_DIAG.get("rows",0)) + " records")
@@ -1561,8 +1600,8 @@ elif page=="Market Calibration":
         )
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V10.1")
-    st.caption("Roster-simulation trade intelligence. V9.1 valuation remains capped and locked; V10.1 adds decision transparency, partner incentive and actionable trade verdicts.")
+    st.markdown("## Trade Centre V10.2")
+    st.caption("Roster-simulation trade intelligence. V9.1 valuation remains capped and locked; V10.2 ranks multiple actionable opportunities by lineup gain, realism and partner incentive.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
     top_obj=my_objectives[0] if my_objectives else None
@@ -1597,18 +1636,42 @@ elif page=="Trade Centre":
             sdf=sdf.sort_values(["_score","Acceptance"],ascending=[False,False])
             sdf=sdf.drop_duplicates(subset=["Partner","_target","Bucket"],keep="first")
 
-            # Small command-centre shortlist.
-            top=sdf.sort_values(["Your impact","Acceptance","_score"],ascending=[False,False,False]).head(3)
-            if len(top):
-                st.markdown("### Top opportunities")
-                cards=st.columns(min(3,len(top)))
-                for i,(_,r) in enumerate(top.iterrows()):
-                    with cards[i]:
-                        st.metric(str(r["You receive"]), f'{r["Your impact"]:+.1f} impact')
-                        st.caption(f'{r["Partner"]} · {r["Offer quality"]}')
-                        st.caption(f'Send: {r["You send"]}')
-                        if r.get("Target note"):
-                            st.caption(r["Target note"])
+            # V10.2 command centre: show multiple actionable options.
+            st.markdown("### Best moves now")
+            st.caption("Ranked by actionability: weekly lineup gain + roster impact + acceptance + fairness + partner incentive − depth cost.")
+            moves=sdf[sdf["V10.2 group"]=="Best moves now"].sort_values(
+                ["Actionability","Acceptance","Lineup gain"],ascending=[False,False,False]
+            ).head(6)
+
+            if len(moves):
+                for i in range(0,len(moves),3):
+                    cols=st.columns(min(3,len(moves)-i))
+                    for j,col in enumerate(cols):
+                        r=moves.iloc[i+j]
+                        with col:
+                            st.markdown(f"#### {r['You receive']}")
+                            st.metric("Lineup gain",f"{r['Lineup gain']:+.1f}")
+                            st.caption(f"{r['Partner']} · {r['Verdict']} · {int(r['Acceptance'])}% accept")
+                            st.caption(f"Send: {r['You send']}")
+                            st.caption(f"Partner impact: {r['Their impact']:+.1f} · Depth: {r['Depth change']:+.1f}")
+                            if r.get("Decision"):
+                                st.caption(r["Decision"])
+            else:
+                st.info("No trades currently qualify as 'Best moves now'.")
+
+            swings=sdf[sdf["V10.2 group"]=="Swing-for-the-fences"].sort_values(
+                ["Actionability","Lineup gain"],ascending=[False,False]
+            ).head(6)
+            if len(swings):
+                st.markdown("### Swing-for-the-fences targets")
+                st.caption("Excellent targets for your roster, but the current package is unlikely to get accepted without a meaningful counter.")
+                st.dataframe(
+                    swings[[
+                        "Partner","You send","You receive","Lineup gain","Their impact",
+                        "Fairness","Acceptance","Verdict","Target note"
+                    ]],
+                    use_container_width=True,hide_index=True
+                )
 
             bucket_order=[
                 "Best realistic upgrades",
@@ -1632,7 +1695,7 @@ elif page=="Trade Centre":
                         st.caption("Lower-cost swings where the upside is more interesting than the immediate projection.")
 
                     cols=[
-                        "Partner","You send","You receive","Verdict","Lineup gain","Depth change",
+                        "Partner","You send","You receive","Verdict","Actionability","Lineup gain","Depth change",
                         "Partner lineup gain","Their impact","Fairness","Acceptance","Decision","Target note"
                     ]
                     st.dataframe(subset[cols].head(6),use_container_width=True,hide_index=True)
