@@ -660,6 +660,55 @@ def team_utility(roster, players, pick_map, rankings):
     raw,_=raw_power(roster,players,pick_map,rankings)
     return raw-sum(needs(roster,players,pick_map,rankings).values())*.35
 
+
+def simulated_lineup(roster, players, pick_map, rankings):
+    """V10 weekly lineup simulation; V9.1 player values are untouched."""
+    rows=[x for x in roster_rows(roster,players,pick_map,rankings)
+          if x["position"] in {"QB","RB","WR","TE"}]
+    by=defaultdict(list)
+    for x in rows: by[x["position"]].append(x)
+    for p in by: by[p]=sorted(by[p],key=lambda x:x["value"],reverse=True)
+
+    slots=[]; used=set()
+    for pos,n in [("QB",1),("RB",2),("WR",2),("TE",1)]:
+        for x in by.get(pos,[])[:n]:
+            slots.append({"slot":pos,"player":x["name"],"value":float(x["value"]),"player_id":x["player_id"]})
+            used.add(x["player_id"])
+
+    flex=sorted([x for x in rows if x["position"] in {"RB","WR","TE"} and x["player_id"] not in used],
+                key=lambda x:x["value"],reverse=True)
+    if flex:
+        x=flex[0]
+        slots.append({"slot":"FLEX","player":x["name"],"value":float(x["value"]),"player_id":x["player_id"]})
+    return slots,sum(x["value"] for x in slots)
+
+def depth_security(roster, players, pick_map, rankings):
+    rows=roster_rows(roster,players,pick_map,rankings)
+    by=defaultdict(list)
+    for x in rows:
+        if x["position"] in {"QB","RB","WR","TE"}: by[x["position"]].append(float(x["value"]))
+    for p in by: by[p].sort(reverse=True)
+    starts={"QB":1,"RB":2,"WR":2,"TE":1}
+    weights={"QB":.10,"RB":.34,"WR":.32,"TE":.15}
+    return sum(sum(by.get(p,[])[starts[p]:starts[p]+2])*weights[p] for p in starts)
+
+def simulated_roster_delta(roster, give_combo, receive_combo, players, pick_map, rankings):
+    before,bscore=simulated_lineup(roster,players,pick_map,rankings)
+    new=roster_after_trade(roster,[x["player_id"] for x in give_combo],[x["player_id"] for x in receive_combo])
+    after,ascore=simulated_lineup(new,players,pick_map,rankings)
+    bd=depth_security(roster,players,pick_map,rankings)
+    ad=depth_security(new,players,pick_map,rankings)
+    changes=[]
+    # Multiple RB/WR slots can exist, so compare player sets by slot family.
+    for slot in ["QB","RB","WR","TE","FLEX"]:
+        b=[x["player"] for x in before if x["slot"]==slot]
+        a=[x["player"] for x in after if x["slot"]==slot]
+        if b!=a: changes.append(f'{slot}: {", ".join(b) or "—"} → {", ".join(a) or "—"}')
+    lineup_delta=ascore-bscore
+    depth_delta=ad-bd
+    return lineup_delta+depth_delta*.22,lineup_delta,depth_delta,changes,before,after
+
+
 def roster_after_trade(roster, give_ids, receive_ids):
     new=dict(roster)
     cur=[str(x) for x in (roster.get("players") or [])]
@@ -982,6 +1031,10 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
 
             starter_gain=projected_starting_upgrade(my_roster,rc,g,players,pick_map,rankings)
             their_starter_gain=projected_starting_upgrade(partner,g,rc,players,pick_map,rankings)
+            sim_gain,lineup_gain,depth_gain,lineup_changes,_,_=simulated_roster_delta(
+                my_roster,g,rc,players,pick_map,rankings)
+            their_sim_gain,their_lineup_gain,their_depth_gain,their_lineup_changes,_,_=simulated_roster_delta(
+                partner,rc,g,players,pick_map,rankings)
 
             you_reason, them_reason, objective_gain, their_objective_gain = trade_rationale(
                 my_roster,partner,g,rc,players,pick_map,rankings
@@ -996,20 +1049,9 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             # V8.4: elite TE acquisition remains valuable, but incremental TE scarcity
             # cannot manufacture several points of roster impact by itself.
             te_component=min(0.85,te_gain*.045)
-            useful_gain = (
-                my_gain
-                + objective_gain*.28
-                + max(0,starter_gain)*.28
-                + te_component
-                - opp_cost
-            )
-            useful_their_gain = (
-                their_gain
-                + their_objective_gain*.22
-                + max(0,their_starter_gain)*.16
-                + min(1.4,their_te_gain*.06)
-                - their_opp_cost
-            )
+            # V10 decision layer: weekly lineup consequence first, depth second.
+            useful_gain = sim_gain*.72 + my_gain*.28 + objective_gain*.16 + max(0,starter_gain)*.12 + te_component*.45 - opp_cost*.55
+            useful_their_gain = their_sim_gain*.72 + their_gain*.28 + their_objective_gain*.14 + max(0,their_starter_gain)*.10 + min(.65,their_te_gain*.035) - their_opp_cost*.55
 
             # V8.1 key rule: don't clutter recommendations with pointless bench swaps.
             receives_starter_upgrade = starter_gain >= .75
@@ -1030,10 +1072,10 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                     continue
 
             meaningful = (
-                useful_gain >= 1.15
-                or starter_gain >= 1.25
-                or (receives_priority_asset and useful_gain >= .85)
-                or consolidation
+                (lineup_gain >= .75 and useful_gain >= .55)
+                or (useful_gain >= 1.15 and lineup_gain >= .20)
+                or (receives_priority_asset and useful_gain >= .85 and lineup_gain >= .15)
+                or (consolidation and useful_gain >= .65 and lineup_gain >= .25)
             )
             if not meaningful:
                 continue
@@ -1107,6 +1149,12 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 why.append("THEM: "+them_reason)
             if len(g)>len(rc):
                 why.append("you pay consolidation premium")
+            if lineup_gain>=.75:
+                why.append("improves simulated weekly lineup")
+            if lineup_changes:
+                why.append("LINEUP: "+", ".join(lineup_changes[:3]))
+            if depth_gain < -3:
+                why.append("depth cost is material")
             if starter_gain>=1.25:
                 why.append("clear weekly starter upgrade")
 
@@ -1120,12 +1168,14 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 "Your impact":round(useful_gain,1),
                 "Their impact":round(useful_their_gain,1),
                 "Starter upgrade":round(starter_gain,1),
+                "Lineup gain":round(lineup_gain,1),
+                "Depth change":round(depth_gain,1),
                 "Fairness":round(fairness),
                 "Acceptance":acceptance,
                 "Acceptance level":acceptance_label(acceptance),
                 "Market disagreement":market_flag,
                 "Why":" · ".join(why),
-                "_score":useful_gain*3.0+max(0,starter_gain)*1.6+useful_their_gain*.9+acceptance*.12+fairness*.04,
+                "_score":useful_gain*2.4+max(0,lineup_gain)*2.8+max(0,starter_gain)*.7+useful_their_gain*.9+acceptance*.12+fairness*.04,
             }
             row_out["Bucket"]=opportunity_bucket(row_out)
             row_out["Offer quality"]=offer_quality(row_out)
@@ -1293,7 +1343,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V9.1 · Normalised Market Engine")
+st.sidebar.success("V10 · V9.1 Valuation Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} FantasyPros-ranked · {engine_fallback} Sleeper-first fallback")
 st.sidebar.caption(
     ("FantasyCalc market connected · " + str(MARKET_DIAG.get("rows",0)) + " records")
@@ -1493,8 +1543,8 @@ elif page=="Market Calibration":
         )
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V9.1")
-    st.caption("Refined trade board: better targets, clearer offer realism, fewer duplicate packages and tighter elite-TE impact — with the V7.1 player engine locked.")
+    st.markdown("## Trade Centre V10")
+    st.caption("Roster-simulation trade intelligence. V9.1 valuation is capped and locked; V10 judges what each deal actually does to both weekly lineups and depth.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
     top_obj=my_objectives[0] if my_objectives else None
@@ -1505,7 +1555,7 @@ elif page=="Trade Centre":
             unsafe_allow_html=True
         )
 
-    tab0,tab1,tab2,tab3,tab4=st.tabs(["Best upgrades","Target builder","Partner finder","Analyser","League market"])
+    tab0,tab1,tab2,tab3,tab4=st.tabs(["Best upgrades","Target builder","Partner finder","Trade simulator","League market"])
 
     with tab0:
         filt=st.selectbox("Show offers against",["All teams"]+[x for x in team_names if x!=my_name],key="v84_all_filter")
@@ -1564,7 +1614,7 @@ elif page=="Trade Centre":
                         st.caption("Lower-cost swings where the upside is more interesting than the immediate projection.")
 
                     cols=[
-                        "Partner","You send","You receive","Your impact","Starter upgrade",
+                        "Partner","You send","You receive","Lineup gain","Your impact","Depth change",
                         "Their impact","Fairness","Acceptance","Offer quality","Target note"
                     ]
                     st.dataframe(subset[cols].head(6),use_container_width=True,hide_index=True)
@@ -1635,7 +1685,7 @@ elif page=="Trade Centre":
         st.dataframe(pd.DataFrame(rows).sort_values("Fit score",ascending=False),use_container_width=True,hide_index=True)
 
     with tab3:
-        st.markdown("### Manual analyser")
+        st.markdown("### Trade simulator")
         partner_name=st.selectbox("Trade partner",[x for x in team_names if x!=my_name],key="v81_manual_partner")
         prid=team_options[partner_name]
         partner=next(r for r in rosters if r["roster_id"]==prid)
@@ -1660,16 +1710,31 @@ elif page=="Trade Centre":
             mg=team_utility(mn,players,pick_map,rankings)-team_utility(my_roster,players,pick_map,rankings)
             tg=team_utility(tn,players,pick_map,rankings)-team_utility(partner,players,pick_map,rankings)
             sg=projected_starting_upgrade(my_roster,rc,gc,players,pick_map,rankings)
+            sim,lg,dg,changes,before_lineup,after_lineup=simulated_roster_delta(my_roster,gc,rc,players,pick_map,rankings)
+            tsim,tlg,tdg,tchanges,_,_=simulated_roster_delta(partner,rc,gc,players,pick_map,rankings)
             you_reason, them_reason, _, _=trade_rationale(my_roster,partner,gc,rc,players,pick_map,rankings)
 
             st.write({
                 "Your roster impact":round(mg,1),
-                "Your starter upgrade":round(sg,1),
+                "Your weekly lineup gain":round(lg,1),
+                "Your depth change":round(dg,1),
+                "Your simulated roster delta":round(sim,1),
+                "Their weekly lineup gain":round(tlg,1),
+                "Their simulated roster delta":round(tsim,1),
                 "Their roster impact":round(tg,1),
                 "Impact class":("League changer" if mg>=3 and sg>=1 else "Clear upgrade" if sg>=.75 and mg>=1.25 else "Roster improvement" if mg>=.75 else "Marginal upgrade" if mg>=.5 else "Negligible"),
             })
             st.markdown(f"**Why you do it:** {you_reason}")
             st.markdown(f"**Why they do it:** {them_reason}")
+            if changes: st.markdown("**Your lineup changes:** " + " · ".join(changes))
+            if tchanges: st.markdown("**Their lineup changes:** " + " · ".join(tchanges))
+            c_before,c_after=st.columns(2)
+            with c_before:
+                st.markdown("#### Your lineup before")
+                st.dataframe(pd.DataFrame(before_lineup)[["slot","player","value"]],use_container_width=True,hide_index=True)
+            with c_after:
+                st.markdown("#### Your lineup after")
+                st.dataframe(pd.DataFrame(after_lineup)[["slot","player","value"]],use_container_width=True,hide_index=True)
 
             if fairness<72:
                 st.error("Market values are too far apart.")
