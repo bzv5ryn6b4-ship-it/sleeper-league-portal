@@ -1118,6 +1118,20 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
             else:
                 market_flag="Low"
 
+            # V10.1 decision verdict — V9.1 valuations remain untouched.
+            if lineup_gain <= 0 or useful_gain <= 0:
+                verdict = "DON'T SEND"
+                verdict_reason = "No meaningful improvement to your usable weekly roster."
+            elif useful_their_gain < -1.0 or fairness < 68 or acceptance < 38:
+                verdict = "LONG SHOT"
+                verdict_reason = "Improves you, but the partner has weak incentive to accept."
+            elif lineup_gain >= 1.0 and useful_gain >= .55 and fairness >= 82 and acceptance >= 55:
+                verdict = "SEND"
+                verdict_reason = "Meaningful lineup improvement with a plausible acceptance path."
+            else:
+                verdict = "NEGOTIATE"
+                verdict_reason = "Useful improvement, but price or partner incentive needs work."
+
             # Classification now reflects actual starting-lineup benefit.
             if useful_gain >= 3.0 and starter_gain >= 1.0:
                 band="League changer"
