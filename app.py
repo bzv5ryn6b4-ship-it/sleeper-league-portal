@@ -1170,6 +1170,10 @@ def generate_trade_suggestions(my_roster, partner, players, pick_map, rankings, 
                 "Starter upgrade":round(starter_gain,1),
                 "Lineup gain":round(lineup_gain,1),
                 "Depth change":round(depth_gain,1),
+                "Verdict":verdict,
+                "Decision":verdict_reason,
+                "Partner lineup gain":round(their_lineup_gain,1),
+                "Partner depth change":round(their_depth_gain,1),
                 "Fairness":round(fairness),
                 "Acceptance":acceptance,
                 "Acceptance level":acceptance_label(acceptance),
@@ -1343,7 +1347,7 @@ if st.sidebar.button("Change my team"):
     if "myteam" in st.query_params: del st.query_params["myteam"]
     st.rerun()
 
-st.sidebar.success("V10 · V9.1 Valuation Engine LOCKED")
+st.sidebar.success("V10.1 · V9.1 Valuation Engine LOCKED")
 st.sidebar.caption(f"{engine_identified}/{engine_total} recognised · {engine_fp} FantasyPros-ranked · {engine_fallback} Sleeper-first fallback")
 st.sidebar.caption(
     ("FantasyCalc market connected · " + str(MARKET_DIAG.get("rows",0)) + " records")
@@ -1543,8 +1547,8 @@ elif page=="Market Calibration":
         )
 
 elif page=="Trade Centre":
-    st.markdown("## Trade Centre V10")
-    st.caption("Roster-simulation trade intelligence. V9.1 valuation is capped and locked; V10 judges what each deal actually does to both weekly lineups and depth.")
+    st.markdown("## Trade Centre V10.1")
+    st.caption("Roster-simulation trade intelligence. V9.1 valuation remains capped and locked; V10.1 adds decision transparency, partner incentive and actionable trade verdicts.")
 
     my_objectives=roster_objectives(my_roster,players,pick_map,rankings)
     top_obj=my_objectives[0] if my_objectives else None
@@ -1614,8 +1618,8 @@ elif page=="Trade Centre":
                         st.caption("Lower-cost swings where the upside is more interesting than the immediate projection.")
 
                     cols=[
-                        "Partner","You send","You receive","Lineup gain","Your impact","Depth change",
-                        "Their impact","Fairness","Acceptance","Offer quality","Target note"
+                        "Partner","You send","You receive","Verdict","Lineup gain","Depth change",
+                        "Partner lineup gain","Their impact","Fairness","Acceptance","Decision","Target note"
                     ]
                     st.dataframe(subset[cols].head(6),use_container_width=True,hide_index=True)
         else:
@@ -1713,9 +1717,24 @@ elif page=="Trade Centre":
             sim,lg,dg,changes,before_lineup,after_lineup=simulated_roster_delta(my_roster,gc,rc,players,pick_map,rankings)
             tsim,tlg,tdg,tchanges,_,_=simulated_roster_delta(partner,rc,gc,players,pick_map,rankings)
             you_reason, them_reason, _, _=trade_rationale(my_roster,partner,gc,rc,players,pick_map,rankings)
+            # Manual simulator verdict uses simulated lineup consequences.
+            if lg <= 0 or sim <= 0:
+                manual_verdict="DON'T SEND"
+                manual_decision="No meaningful weekly roster improvement."
+            elif tlg < -1.0 and tsim < 0:
+                manual_verdict="LONG SHOT"
+                manual_decision="Strong for you, but their simulated roster gets worse."
+            elif lg >= 1.0 and sim >= .55 and tsim >= -.25:
+                manual_verdict="SEND"
+                manual_decision="Clear weekly improvement without crushing the partner roster."
+            else:
+                manual_verdict="NEGOTIATE"
+                manual_decision="Useful move, but the price or partner incentive needs work."
 
             st.write({
                 "Your roster impact":round(mg,1),
+                "Verdict":manual_verdict,
+                "Decision":manual_decision,
                 "Your weekly lineup gain":round(lg,1),
                 "Your depth change":round(dg,1),
                 "Your simulated roster delta":round(sim,1),
@@ -1726,8 +1745,14 @@ elif page=="Trade Centre":
             })
             st.markdown(f"**Why you do it:** {you_reason}")
             st.markdown(f"**Why they do it:** {them_reason}")
-            if changes: st.markdown("**Your lineup changes:** " + " · ".join(changes))
-            if tchanges: st.markdown("**Their lineup changes:** " + " · ".join(tchanges))
+            if changes:
+                st.markdown("**Your lineup changes:** " + " · ".join(changes))
+            else:
+                st.markdown("**Your lineup changes:** No starter changes — primarily a depth move.")
+            if tchanges:
+                st.markdown("**Their lineup changes:** " + " · ".join(tchanges))
+            else:
+                st.markdown("**Their lineup changes:** No immediate starter changes.")
             c_before,c_after=st.columns(2)
             with c_before:
                 st.markdown("#### Your lineup before")
